@@ -136,6 +136,7 @@ _CANONICAL_TIMING_PREFIXES = {
 }
 
 
+
 def source_timing_bucket(source_text: str) -> str:
     """Extract timing only from an explicit infant-age or post-birth expression."""
     number_words = {
