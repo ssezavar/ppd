@@ -42,7 +42,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-SCRIPT_VERSION = "ppd_generate_final v4.14"
+SCRIPT_VERSION = "ppd_generate_final v4.25"
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 FAILED_SENTINEL = "[GENERATION_FAILED]"
 
@@ -134,7 +134,6 @@ _CANONICAL_TIMING_PREFIXES = {
     TIMING_BUCKETS[2]: "I am between six and twelve weeks after birth.",
     TIMING_BUCKETS[3]: "I am more than three months after birth.",
 }
-
 
 
 def source_timing_bucket(source_text: str) -> str:
@@ -310,6 +309,21 @@ def calibrate_blind_severity(text: str, predicted: str) -> str:
         value,
         re.I,
     ))
+    value_lower = value.lower()
+    persistent = persistent or any(
+        phrase in value_lower
+        for phrase in ("each day", "every day", "still struggling", "continues to")
+    )
+    natural_distress = bool(re.search(
+        r"\b(?:depress\w*|distress\w*|struggl\w*|difficult|significant(?:ly)?|"
+        r"hard to cope|battle\w*|emotionally heavy)\b",
+        value,
+        re.I,
+    ))
+    natural_distress = natural_distress or any(
+        phrase in value_lower
+        for phrase in ("struggling", "hard to cope", "battle", "significantly")
+    )
     impairment = bool(re.search(
         r"\b(?:impair\w*|unable to function|cannot function|can't function|"
         r"hard to (?:complete|manage|handle|do) (?:basic |daily |everyday )?(?:tasks|activities)|"
@@ -320,7 +334,9 @@ def calibrate_blind_severity(text: str, predicted: str) -> str:
     ))
     bonding_or_risk = bool(_SUPPORTED_DETAIL_PATTERNS["high-risk/bonding detail"].search(value))
     resolved = bool(re.search(r"\b(?:resolved|recovered|improved|no longer present)\b", value, re.I))
-    moderate_gate = (persistent and intensity in {"moderate", "high"}) or impairment or bonding_or_risk
+    moderate_gate = (
+        persistent and (intensity in {"moderate", "high"} or natural_distress)
+    ) or impairment or bonding_or_risk
     severe_gate = intensity == "high" and (impairment or bonding_or_risk)
     if severe_gate:
         return "Severe"
@@ -509,6 +525,51 @@ def text_values(value: Any) -> str:
     return ""
 
 
+_GROUNDING_STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "been", "being", "but", "by",
+    "for", "from", "has", "have", "i", "in", "is", "it", "me", "my",
+    "of", "on", "that", "the", "these", "this", "to", "was", "with",
+}
+
+
+def grounding_tokens(text: str) -> set[str]:
+    aliases = {
+        "noticed": "recognize", "notice": "recognize", "realized": "recognize",
+        "realize": "recognize", "recognized": "recognize", "recognise": "recognize",
+        "changes": "change", "changed": "change", "changing": "change",
+        "struggling": "difficult", "struggle": "difficult", "hard": "difficult",
+        "persistent": "ongoing", "persisting": "ongoing",
+    }
+    tokens = set()
+    for token in normalized_tokens(text):
+        token = aliases.get(token, token)
+        if token not in _GROUNDING_STOPWORDS and len(token) > 2:
+            tokens.add(token)
+    return tokens
+
+
+def reconcile_grounding_assessment(
+    assessment: dict[str, Any], factors: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove auditor claims that clearly overlap the supplied factual boundary."""
+    claims = [str(value).strip() for value in assessment.get("unsupported_claims", [])]
+    factor_tokens = grounding_tokens(text_values(factors))
+    remaining = []
+    reconciled = []
+    for claim in claims:
+        overlap = grounding_tokens(claim) & factor_tokens
+        if len(overlap) >= 2:
+            reconciled.append(claim)
+        else:
+            remaining.append(claim)
+    assessment["unsupported_claims"] = remaining
+    assessment["reconciled_supported_claims"] = reconciled
+    assessment["grounded"] = not remaining
+    if reconciled and not remaining:
+        assessment["reason"] = "Auditor claims were direct restatements of supplied factors."
+    return assessment
+
+
 def missing_list_value(value: Any) -> bool:
     """Recognize empty model placeholders before they become factual support."""
     normalized = re.sub(r"\s+", " ", str(value or "")).strip().lower()
@@ -575,6 +636,46 @@ def stage3_provenance(generated: dict[str, Any]) -> str:
         if str(entry.get("round", "")).startswith("fallback"):
             return "fallback"
     return "llm" if history else ""
+
+
+def narrative_word_bounds(
+    factors: dict[str, Any], cfg: dict[str, Any]
+) -> tuple[int, int]:
+    """Match narrative length to the amount of supported source evidence."""
+    if not cfg.get("use_adaptive_length", True):
+        return int(cfg["min_words"]), int(cfg["max_words"])
+
+    evidence_units = 1 if str(factors.get("deidentified_summary", "")).strip() else 0
+    for key in (
+        "symptoms", "functional_impact", "feeding_or_infant_care_stressors",
+        "bonding_indicators", "risk_indicators",
+    ):
+        evidence_units += sum(
+            bool(str(value).strip()) for value in factors.get(key, [])
+        )
+    for key in (
+        "symptom_persistence", "sleep_context", "perceived_support",
+        "coping_or_adjustment_context",
+    ):
+        value = str(factors.get(key, "")).strip().lower()
+        if value and value not in {"unknown", "not stated", "not specified"}:
+            evidence_units += 1
+    if str(factors.get("postpartum_timing", "unknown")) != "unknown":
+        evidence_units += 1
+
+    if evidence_units <= 4:
+        return int(cfg["sparse_min_words"]), int(cfg["sparse_max_words"])
+    return int(cfg["min_words"]), int(cfg["max_words"])
+
+
+def narrative_prompt_bounds(
+    factors: dict[str, Any], cfg: dict[str, Any]
+) -> tuple[int, int]:
+    """Leave a small margin between the requested and hard maximum."""
+    low, high = narrative_word_bounds(factors, cfg)
+    if cfg.get("use_adaptive_length", True) and high == int(cfg["sparse_max_words"]):
+        high = max(low, int(cfg["sparse_target_max_words"]))
+    return low, high
 
 
 def conservative_factor_narrative(
@@ -894,6 +995,9 @@ def call_ollama(
             "seed": seed,
         },
     }
+    # 2026-08-27: Qwen3 needs thinking disabled for strict JSON responses.
+    if cfg["ollama_thinking"] != "auto":
+        payload["think"] = cfg["ollama_thinking"] == "on"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_error = ""
     started = time.monotonic()
@@ -1028,6 +1132,93 @@ INPUT:
 {json.dumps(items, ensure_ascii=False)}"""
 
 
+def prompt_direct_baseline(
+    items: Sequence[dict[str, Any]],
+    use_timing: bool,
+    min_words: int,
+    max_words: int,
+    sparse_min_words: int,
+    sparse_target_max_words: int,
+    sparse_max_words: int,
+    use_adaptive_length: bool,
+    regeneration_attempt: int = 0,
+    correction_attempt: int = 0,
+) -> str:
+    """One-call generation baseline used as an architectural ablation."""
+    timing = TIMING_DEFS + "\n" if use_timing else ""
+    factor_timing = ', "postpartum_timing": "one timing bucket"' if use_timing else ""
+    narrative_timing = ', "timing": "same exact timing bucket"' if use_timing else ""
+    sentence_schema = ", ".join(
+        f'"s{index:02d}": "5-15 words"'
+        for index in range(1, STAGE3_SENTENCE_COUNT + 1)
+    )
+    retry_note = ""
+    if regeneration_attempt:
+        retry_note = (
+            f"This is regeneration attempt {regeneration_attempt}. Each affected input may "
+            "contain validator_feedback and required_severity/required_timing. Preserve those "
+            "required values and correct the blind-rater mismatch without adding facts.\n"
+        )
+    correction_note = ""
+    if correction_attempt > 1:
+        correction_note = (
+            "A prior response failed strict validation. Recheck every required field, "
+            "the exact required timing, the word limit, and the severity boundaries. "
+            "Ongoing moderate/high symptoms cannot be Mild; high intensity alone cannot "
+            "be Severe without supported major impact, bonding disruption, or risk.\n"
+        )
+    length_rule = (
+        f"When the extracted factors contain at most four supported evidence units, "
+        f"use {sparse_min_words}-{sparse_target_max_words} "
+        f"assembled words. Otherwise use "
+        f"{min_words}-{max_words} words."
+        if use_adaptive_length
+        else f"Use {min_words}-{max_words} assembled words."
+    )
+    return f"""Create privacy-preserving synthetic postpartum narratives directly from
+source posts. This is a one-prompt baseline: perform abstraction, severity assignment,
+and narrative generation in this single response.
+
+{DEID_RULES}
+{SEVERITY_DEFS}
+{SEVERITY_BOUNDARY_RULES}
+{timing}
+{retry_note}{correction_note}
+For each input, return one object with this exact nested structure:
+{{"id": 0,
+ "factors": {{"deidentified_summary": "2-3 generalized sentences"{factor_timing},
+  "symptoms": ["..."], "symptom_intensity": "low|moderate|high",
+  "symptom_persistence": "...", "functional_impact": ["..."],
+  "sleep_context": "...", "feeding_or_infant_care_stressors": ["..."],
+  "perceived_support": "...", "bonding_indicators": ["..."],
+  "risk_indicators": ["..."], "coping_or_adjustment_context": "..."}},
+ "classification": {{"severity": "Minimal|Mild|Moderate|Severe",
+  "rationale": "one grounded sentence"}},
+ "narrative": {{"sentences": {{{sentence_schema}}},
+  "target": "same exact severity"{narrative_timing},
+  "style": "first-person postpartum diary"}}}}
+
+Requirements:
+- Return exactly {STAGE3_SENTENCE_COUNT} narrative sentence slots. {length_rule}
+  Write naturally in first person using I/my.
+- Extract every supported factor, but never infer a missing symptom, impairment, risk,
+  relationship, treatment, event, cause, or duration.
+- Do not copy or closely paraphrase the source and do not retain identifiers.
+- The classification must satisfy the stated severity boundary rules.
+- Explicitly compute which labels conflict with the extracted factors before choosing.
+  Persistent moderate/high symptoms require at least Moderate. Severe requires high
+  intensity plus supported impact, bonding disruption, hopelessness, or urgent risk.
+- The narrative must use only its factors and match its classification.
+- For known timing, use exactly the compatible broad phrase: within the first two weeks
+  after birth; between two and six weeks after birth; between six and twelve weeks after
+  birth; or more than three months after birth. For unknown timing, include no time cue.
+- If required_severity or required_timing is present, copy it exactly into the output.
+
+Return a JSON list with exactly one output per input ID. {JSON_ONLY}
+INPUT:
+{json.dumps(items, ensure_ascii=False)}"""
+
+
 def prompt_stage2(items: Sequence[dict[str, Any]], use_timing: bool) -> str:
     timing_note = (
         "The factors include postpartum_timing. Treat it only as context.\n" if use_timing else ""
@@ -1090,7 +1281,7 @@ def prompt_stage3(
         correction = (
             "A prior response failed strict validation, commonly because it was too short. "
             f"Fill all {STAGE3_SENTENCE_COUNT} required sentence slots this time. "
-            "Each slot must contain 7-15 words. "
+            "Each slot must contain 5-15 words. "
             "Do not omit slots or return a short summary.\n"
         )
     return f"""Generate original first-person postpartum diary narratives for
@@ -1101,9 +1292,11 @@ research. Stage 3 receives generalized factors only, never source posts.
 {timing}
 {timing_instruction}{regeneration}{correction}
 Constraints:
-- The assembled narrative must contain {min_words}-{max_words} words.
+- Each input contains required_min_words and required_max_words. Its assembled
+  narrative must stay inside that exact range. The overall configured ceiling is
+  {min_words}-{max_words} words for richer inputs.
 - Fill exactly {STAGE3_SENTENCE_COUNT} ordered sentence slots, each containing
-  7-15 words. The slots are joined into two paragraphs, producing 28-60 words.
+  5-15 words. Short, evidence-sparse inputs should use concise slots.
 - Ground every sentence in at least one supplied factor. With sparse factors,
   reflect on the same supported experience without adding symptoms, impairment,
   relationships, actions, causes, or duration.
@@ -1143,10 +1336,10 @@ INPUT:
 def prompt_stage3_length_repair(
     item: dict[str, Any], min_words: int, max_words: int, use_timing: bool
 ) -> str:
-    target_low = min(max_words, max(min_words, 36))
+    target_low = min_words
     target_high = min(max_words, max(target_low, 60))
     sentence_low = max(
-        7, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
     )
     sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
     sentence_schema = ", ".join(
@@ -1213,10 +1406,10 @@ def prompt_stage3_content_repair(
     item: dict[str, Any], categories: Sequence[str], min_words: int, max_words: int,
     use_timing: bool,
 ) -> str:
-    target_low = min(max_words, max(min_words, 36))
+    target_low = min_words
     target_high = min(max_words, max(target_low, 60))
     sentence_low = max(
-        7, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
     )
     sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
     sentence_schema = ", ".join(
@@ -1362,10 +1555,10 @@ INPUT:
 def prompt_stage3_semantic_repair(
     item: dict[str, Any], min_words: int, max_words: int, use_timing: bool
 ) -> str:
-    target_low = min(max_words, max(min_words, 36))
+    target_low = min_words
     target_high = min(max_words, max(target_low, 60))
     sentence_low = max(
-        7, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
     )
     sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
     sentence_schema = ", ".join(
@@ -1510,6 +1703,17 @@ def validate_stage1(
         return False, f"invalid symptom_intensity: {item.get('symptom_intensity')!r}"
     if use_timing:
         item["postpartum_timing"] = source_timing_bucket(source_text)
+        if item["postpartum_timing"] == "unknown":
+            summary = str(item.get("deidentified_summary", ""))
+            summary = re.sub(
+                r"\b(?:within|during|around|about|approximately|several|a few|"
+                r"a couple of?|one|two|three|four|\d+)\s+"
+                r"(?:days?|weeks?|months?)\s+(?:postpartum|after (?:giving )?birth)\b",
+                "after giving birth",
+                summary,
+                flags=re.I,
+            )
+            item["deidentified_summary"] = summary
     privacy_text = text_values({key: value for key, value in item.items() if key != "id"})
     leaks = identifier_leaks(privacy_text)
     if leaks:
@@ -1637,6 +1841,11 @@ def validate_stage3(
         return False, f"target mismatch: {item.get('target')!r}"
     if use_timing:
         normalized_timing = normalize_timing(item.get("timing"))
+        if normalized_timing is None and expected_timing in TIMING_SET:
+            # Metadata can be restored; narrative timing is still checked below.
+            normalized_timing = expected_timing
+            item["timing"] = expected_timing
+            item["timing_metadata_injected"] = True
         if normalized_timing != expected_timing:
             return False, f"timing mismatch: {item.get('timing')!r}"
         item["timing"] = normalized_timing
@@ -1832,11 +2041,12 @@ def run_group_stage(
         attempt_group(pending, attempt_number)
 
     pending = [item_id for item_id in ids if results[item_id].status != "ok"]
-    for item_id in pending:
-        for retry in range(1, cfg["schema_retries"] + 1):
-            attempt_group([item_id], cfg["schema_retries"] + retry)
-            if results[item_id].status == "ok":
-                break
+    if cfg.get("use_single_retry_pass", True):
+        for item_id in pending:
+            for retry in range(1, cfg["schema_retries"] + 1):
+                attempt_group([item_id], cfg["schema_retries"] + retry)
+                if results[item_id].status == "ok":
+                    break
     return results
 
 
@@ -1845,7 +2055,7 @@ def stage1(
 ) -> dict[int, ItemResult]:
     ids = list(records)
 
-    def make_prompt(group_ids: Sequence[int], _: int) -> str:
+    def make_prompt(group_ids: Sequence[int], schema_attempt: int) -> str:
         return prompt_stage1(
             [{"id": item_id, "post": records[item_id]["source_text"]} for item_id in group_ids],
             cfg["use_timing"],
@@ -1904,7 +2114,7 @@ def stage2(
     if not eligible:
         return output
 
-    def make_prompt(group_ids: Sequence[int], _: int) -> str:
+    def make_prompt(group_ids: Sequence[int], schema_attempt: int) -> str:
         payloads = []
         for item_id in group_ids:
             payload = factor_payload(item_id, eligible[item_id], cfg["use_timing"])
@@ -1933,6 +2143,277 @@ def stage2(
     return output
 
 
+def validate_direct_baseline(
+    item: Any,
+    *,
+    expected_id: int,
+    source_text: str,
+    cfg: dict[str, Any],
+    required_severity: str = "",
+    required_timing: str = "",
+) -> tuple[bool, str]:
+    if not isinstance(item, dict) or item.get("id") != expected_id:
+        return False, "direct schema: missing or mismatched id"
+    if not all(isinstance(item.get(key), dict) for key in ("factors", "classification", "narrative")):
+        return False, "direct schema: factors, classification, and narrative must be objects"
+
+    factors = dict(item["factors"])
+    factors["id"] = expected_id
+    ok, error = validate_stage1(
+        factors,
+        expected_id=expected_id,
+        source_text=source_text,
+        use_timing=cfg["use_timing"],
+        copy_ngram_size=cfg["copy_ngram_size"],
+        max_copy_ngrams=cfg["max_copy_ngrams"],
+    )
+    if not ok:
+        return False, "stage1: " + error
+
+    classification = dict(item["classification"])
+    classification["id"] = expected_id
+    ok, error = validate_stage2(
+        classification, expected_id=expected_id, factors=factors
+    )
+    if not ok:
+        allowed = [
+            label for label in EPDS_LABELS
+            if label not in disallowed_severity_labels(factors)
+        ]
+        if len(allowed) == 1:
+            # Boundary rules can resolve an otherwise contradictory direct label.
+            classification["severity"] = allowed[0]
+            classification["rationale"] = (
+                "Deterministic boundary correction from the extracted factors."
+            )
+            ok, error = validate_stage2(
+                classification, expected_id=expected_id, factors=factors
+            )
+    if not ok:
+        return False, "stage2: " + error
+    if required_severity and classification.get("severity") != required_severity:
+        return False, f"stage2: required severity mismatch: {classification.get('severity')!r}"
+
+    narrative = dict(item["narrative"])
+    narrative["id"] = expected_id
+    narrative["target"] = classification["severity"]
+    expected_timing = str(factors.get("postpartum_timing", "unknown"))
+    if required_timing and expected_timing != required_timing:
+        return False, f"stage1: required timing mismatch: {expected_timing!r}"
+    item_min, item_max = narrative_word_bounds(factors, cfg)
+    ok, error = validate_stage3(
+        narrative,
+        expected_id=expected_id,
+        expected_severity=str(classification["severity"]),
+        expected_timing=expected_timing,
+        source_text=source_text,
+        use_timing=cfg["use_timing"],
+        min_words=item_min,
+        max_words=item_max,
+        copy_ngram_size=cfg["copy_ngram_size"],
+        max_copy_ngrams=cfg["max_copy_ngrams"],
+    )
+    if not ok:
+        return False, "stage3: " + error
+    unsupported = unsupported_detail_categories(
+        str(narrative.get("synthetic_text", "")), factors
+    )
+    if unsupported:
+        return False, "stage3: unsupported detail: " + ",".join(unsupported)
+
+    item["factors"] = factors
+    item["classification"] = classification
+    item["narrative"] = narrative
+    return True, ""
+
+
+def generate_direct_baseline(
+    *,
+    ids: Sequence[int],
+    records: dict[int, dict[str, Any]],
+    cfg: dict[str, Any],
+    usage: Usage,
+    regeneration_attempt: int = 0,
+    validator_feedback: dict[int, dict[str, Any]] | None = None,
+    required_targets: dict[int, tuple[str, str]] | None = None,
+) -> dict[int, ItemResult]:
+    """Generate factors, severity, and narrative together in one model call."""
+    def make_prompt(group_ids: Sequence[int], schema_attempt: int) -> str:
+        payloads = []
+        for item_id in group_ids:
+            payload: dict[str, Any] = {
+                "id": item_id,
+                "post": records[item_id]["source_text"],
+            }
+            if cfg["use_timing"]:
+                # 2026-08-29: anchor timing to explicit birth-relative wording.
+                payload["required_timing"] = source_timing_bucket(
+                    records[item_id]["source_text"]
+                )
+            if validator_feedback and item_id in validator_feedback:
+                payload["validator_feedback"] = validator_feedback[item_id]
+            if required_targets and item_id in required_targets:
+                severity, timing = required_targets[item_id]
+                payload["required_severity"] = severity
+                if cfg["use_timing"]:
+                    payload["required_timing"] = timing
+            payloads.append(payload)
+        return prompt_direct_baseline(
+            payloads,
+            cfg["use_timing"],
+            cfg["min_words"],
+            cfg["max_words"],
+            cfg["sparse_min_words"],
+            cfg["sparse_target_max_words"],
+            cfg["sparse_max_words"],
+            cfg["use_adaptive_length"],
+            regeneration_attempt,
+            schema_attempt,
+        )
+
+    def validator(item: dict[str, Any], item_id: int) -> tuple[bool, str]:
+        required_severity = ""
+        required_timing = (
+            source_timing_bucket(records[item_id]["source_text"])
+            if cfg["use_timing"] else ""
+        )
+        if required_targets and item_id in required_targets:
+            required_severity, required_timing = required_targets[item_id]
+        return validate_direct_baseline(
+            item,
+            expected_id=item_id,
+            source_text=records[item_id]["source_text"],
+            cfg=cfg,
+            required_severity=required_severity,
+            required_timing=required_timing,
+        )
+
+    direct_cfg = {
+        **cfg,
+        "schema_retries": 1,
+        "use_single_retry_pass": False,
+    }
+    return run_group_stage(
+        ids=ids,
+        make_prompt=make_prompt,
+        validator=validator,
+        cfg=direct_cfg,
+        temperature=cfg["temp_s3"],
+        tokens_per_item=cfg["tokens_direct_per_item"],
+        stage_number=100 + regeneration_attempt * 10,
+        usage=usage,
+    )
+
+
+def split_direct_results(
+    ids: Sequence[int], direct: dict[int, ItemResult]
+) -> tuple[dict[int, ItemResult], dict[int, ItemResult], dict[int, ItemResult]]:
+    s1: dict[int, ItemResult] = {}
+    s2: dict[int, ItemResult] = {}
+    s3: dict[int, ItemResult] = {}
+    for item_id in ids:
+        result = direct[item_id]
+        if result.status == "ok" and result.value is not None:
+            common = {"status": "ok", "attempts": result.attempts, "errors": list(result.errors)}
+            s1[item_id] = ItemResult(value=result.value["factors"], **common)
+            s2[item_id] = ItemResult(value=result.value["classification"], **common)
+            s3[item_id] = ItemResult(value=result.value["narrative"], **common)
+        else:
+            error = "direct generation failed: " + last_error(result)
+            s1[item_id] = ItemResult(
+                last_candidate=result.last_candidate,
+                status="failed",
+                attempts=result.attempts,
+                errors=[error],
+            )
+            s2[item_id] = ItemResult(status="failed", attempts=result.attempts, errors=[error])
+            s3[item_id] = ItemResult(status="failed", attempts=result.attempts, errors=[error])
+    return s1, s2, s3
+
+
+def audit_direct_grounding(
+    *,
+    ids: Sequence[int],
+    s1: dict[int, ItemResult],
+    s2: dict[int, ItemResult],
+    s3: dict[int, ItemResult],
+    cfg: dict[str, Any],
+    usage: Usage,
+    regeneration_attempt: int = 0,
+) -> None:
+    active = [
+        item_id for item_id in ids
+        if s1[item_id].status == s2[item_id].status == s3[item_id].status == "ok"
+    ]
+    if not active:
+        return
+
+    def make_prompt(group_ids: Sequence[int], _: int) -> str:
+        payloads = []
+        for item_id in group_ids:
+            payloads.append(
+                {
+                    "id": item_id,
+                    "factors": generation_payload(
+                        item_id,
+                        s1[item_id].value or {},
+                        s2[item_id].value or {},
+                        cfg["use_timing"],
+                    ),
+                    "required_timing": (s1[item_id].value or {}).get(
+                        "postpartum_timing", "unknown"
+                    ),
+                    "narrative": (s3[item_id].value or {}).get("synthetic_text", ""),
+                }
+            )
+        return prompt_stage3_grounding_audit(payloads)
+
+    audits = run_group_stage(
+        ids=active,
+        make_prompt=make_prompt,
+        validator=lambda item, item_id: validate_grounding_audit(
+            item, expected_id=item_id
+        ),
+        cfg={**cfg, "schema_retries": max(2, cfg["schema_retries"])},
+        temperature=0.0,
+        tokens_per_item=cfg["tokens_s4_per_item"],
+        stage_number=110 + regeneration_attempt * 10,
+        usage=usage,
+    )
+    for item_id in active:
+        audit = audits[item_id]
+        generated = s3[item_id]
+        if audit.status != "ok" or audit.value is None:
+            generated.status = "failed"
+            generated.errors.append("direct grounding audit failed: " + last_error(audit))
+            continue
+        assessment = reconcile_grounding_assessment(
+            audit.value, s1[item_id].value or {}
+        )
+        history = [
+            {
+                "round": f"direct_{regeneration_attempt}",
+                "grounded": assessment["grounded"],
+                "unsupported_claims": assessment["unsupported_claims"],
+                "reconciled_supported_claims": assessment.get(
+                    "reconciled_supported_claims", []
+                ),
+                "reason": assessment["reason"],
+            }
+        ]
+        if not assessment["grounded"]:
+            generated.status = "failed"
+            generated.errors.append(
+                "direct grounding rejected: " + "; ".join(assessment["unsupported_claims"])
+            )
+            generated.last_candidate = generated.value
+            generated.value = None
+            continue
+        generated.value["grounding_passed"] = True
+        generated.value["grounding_attempts"] = audit.attempts
+        generated.value["grounding_history"] = history
+
+
 def generation_payload(
     item_id: int,
     factors: dict[str, Any],
@@ -1956,6 +2437,12 @@ def generate_stage3(
     regeneration_attempt: int = 0,
     validator_feedback: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, ItemResult]:
+    def bounds(item_id: int) -> tuple[int, int]:
+        return narrative_word_bounds(stage1_results[item_id].value or {}, cfg)
+
+    def prompt_bounds(item_id: int) -> tuple[int, int]:
+        return narrative_prompt_bounds(stage1_results[item_id].value or {}, cfg)
+
     def make_prompt(group_ids: Sequence[int], schema_attempt: int) -> str:
         payloads = []
         for item_id in group_ids:
@@ -1967,6 +2454,9 @@ def generate_stage3(
             )
             if validator_feedback and item_id in validator_feedback:
                 payload["validator_feedback"] = validator_feedback[item_id]
+            item_min, item_max = prompt_bounds(item_id)
+            payload["required_min_words"] = item_min
+            payload["required_max_words"] = item_max
             payloads.append(payload)
         return prompt_stage3(
             payloads,
@@ -1980,6 +2470,7 @@ def generate_stage3(
     def validator(item: dict[str, Any], item_id: int) -> tuple[bool, str]:
         factors = stage1_results[item_id].value or {}
         severity = stage2_results[item_id].value or {}
+        item_min, item_max = bounds(item_id)
         return validate_stage3(
             item,
             expected_id=item_id,
@@ -1987,8 +2478,8 @@ def generate_stage3(
             expected_timing=str(factors.get("postpartum_timing", "unknown")),
             source_text=records[item_id]["source_text"],
             use_timing=cfg["use_timing"],
-            min_words=cfg["min_words"],
-            max_words=cfg["max_words"],
+            min_words=item_min,
+            max_words=item_max,
             copy_ngram_size=cfg["copy_ngram_size"],
             max_copy_ngrams=cfg["max_copy_ngrams"],
         )
@@ -2006,12 +2497,13 @@ def generate_stage3(
 
     repair_ids = []
     for item_id, result in generated.items():
+        item_min, _ = bounds(item_id)
         candidate = result.last_candidate or {}
         candidate_text = candidate.get("synthetic_text")
         if (
             result.status != "ok"
             and isinstance(candidate_text, str)
-            and word_count(candidate_text) < cfg["min_words"]
+            and word_count(candidate_text) < item_min
         ):
             repair_ids.append(item_id)
 
@@ -2019,6 +2511,7 @@ def generate_stage3(
         item_id = group_ids[0]
         factors = stage1_results[item_id].value or {}
         severity = stage2_results[item_id].value or {}
+        item_min, item_max = prompt_bounds(item_id)
         payload = {
             "id": item_id,
             "factors": generation_payload(item_id, factors, severity, cfg["use_timing"]),
@@ -2029,7 +2522,7 @@ def generate_stage3(
             ),
         }
         return prompt_stage3_length_repair(
-            payload, cfg["min_words"], cfg["max_words"], cfg["use_timing"]
+            payload, item_min, item_max, cfg["use_timing"]
         )
 
     repair_cfg = {**cfg, "schema_retries": max(2, cfg["schema_retries"])}
@@ -2070,6 +2563,7 @@ def generate_stage3(
         item_id = group_ids[0]
         factors = stage1_results[item_id].value or {}
         severity = stage2_results[item_id].value or {}
+        item_min, item_max = prompt_bounds(item_id)
         payload = {
             "id": item_id,
             "factors": generation_payload(item_id, factors, severity, cfg["use_timing"]),
@@ -2080,8 +2574,8 @@ def generate_stage3(
         return prompt_stage3_content_repair(
             payload,
             content_categories[item_id],
-            cfg["min_words"],
-            cfg["max_words"],
+            item_min,
+            item_max,
             cfg["use_timing"],
         )
 
@@ -2117,12 +2611,13 @@ def generate_stage3(
             continue
         factors = stage1_results[item_id].value or {}
         severity = stage2_results[item_id].value or {}
+        item_min, item_max = bounds(item_id)
         fallback = conservative_factor_narrative(
             factors,
             str(severity.get("severity", "")),
             cfg["use_timing"],
-            cfg["min_words"],
-            cfg["max_words"],
+            item_min,
+            item_max,
             item_id,
         )
         fallback["id"] = item_id
@@ -2209,12 +2704,13 @@ def generate_stage3(
                 result.errors.append("semantic grounding audit failed: " + last_error(audit))
                 factors = stage1_results[item_id].value or {}
                 severity = stage2_results[item_id].value or {}
+                item_min, item_max = bounds(item_id)
                 fallback = conservative_factor_narrative(
                     factors,
                     str(severity.get("severity", "")),
                     cfg["use_timing"],
-                    cfg["min_words"],
-                    cfg["max_words"],
+                    item_min,
+                    item_max,
                     item_id,
                 )
                 fallback["id"] = item_id
@@ -2250,12 +2746,17 @@ def generate_stage3(
                     )
                 continue
 
-            assessment = audit.value
+            assessment = reconcile_grounding_assessment(
+                audit.value, stage1_results[item_id].value or {}
+            )
             grounding_history[item_id].append(
                 {
                     "round": audit_round,
                     "grounded": assessment["grounded"],
                     "unsupported_claims": assessment["unsupported_claims"],
+                    "reconciled_supported_claims": assessment.get(
+                        "reconciled_supported_claims", []
+                    ),
                     "reason": assessment["reason"],
                 }
             )
@@ -2268,12 +2769,13 @@ def generate_stage3(
             if audit_round == 1:
                 factors = stage1_results[item_id].value or {}
                 severity = stage2_results[item_id].value or {}
+                item_min, item_max = bounds(item_id)
                 fallback = conservative_factor_narrative(
                     factors,
                     str(severity.get("severity", "")),
                     cfg["use_timing"],
-                    cfg["min_words"],
-                    cfg["max_words"],
+                    item_min,
+                    item_max,
                     item_id,
                 )
                 fallback["id"] = item_id
@@ -2317,6 +2819,7 @@ def generate_stage3(
         for item_id in repair_ids:
             factors = stage1_results[item_id].value or {}
             severity = stage2_results[item_id].value or {}
+            prompt_min, prompt_max = prompt_bounds(item_id)
 
             def semantic_prompt(_: Sequence[int], __: int) -> str:
                 payload = {
@@ -2332,7 +2835,7 @@ def generate_stage3(
                     "unsupported_claims": repair_claims[item_id],
                 }
                 return prompt_stage3_semantic_repair(
-                    payload, cfg["min_words"], cfg["max_words"], cfg["use_timing"]
+                    payload, prompt_min, prompt_max, cfg["use_timing"]
                 )
 
             prior = generated[item_id]
@@ -2352,12 +2855,13 @@ def generate_stage3(
             if repaired.status == "ok" and repaired.value is not None:
                 next_active.append(item_id)
             else:
+                item_min, item_max = bounds(item_id)
                 fallback = conservative_factor_narrative(
                     factors,
                     str(severity.get("severity", "")),
                     cfg["use_timing"],
-                    cfg["min_words"],
-                    cfg["max_words"],
+                    item_min,
+                    item_max,
                     item_id,
                 )
                 fallback["id"] = item_id
@@ -2542,6 +3046,123 @@ def stages3_and4(
     return stage3_results, stage4_results, outcomes
 
 
+def direct_stages_and4(
+    *,
+    records: dict[int, dict[str, Any]],
+    cfg: dict[str, Any],
+    usage: Usage,
+) -> tuple[
+    dict[int, ItemResult], dict[int, ItemResult], dict[int, ItemResult],
+    dict[int, ItemResult], dict[int, dict[str, Any]],
+]:
+    """Run the one-prompt ablation under the standard acceptance gates."""
+    ids = list(records)
+    direct = generate_direct_baseline(
+        ids=ids, records=records, cfg=cfg, usage=usage
+    )
+    s1, s2, s3 = split_direct_results(ids, direct)
+    audit_direct_grounding(
+        ids=ids, s1=s1, s2=s2, s3=s3, cfg=cfg, usage=usage
+    )
+    s4 = {item_id: ItemResult(status="not_run") for item_id in ids}
+    outcomes = {
+        item_id: {"row_status": "failed", "regen_count": 0, "validator_history": []}
+        for item_id in ids
+    }
+
+    for item_id in ids:
+        if s3[item_id].status != "ok" or s3[item_id].value is None:
+            outcomes[item_id]["row_status"] = "direct_generation_failed"
+            continue
+        if not cfg["use_validator"]:
+            s4[item_id] = ItemResult(status="skipped")
+            outcomes[item_id]["row_status"] = "accepted"
+            continue
+
+        intended = str((s2[item_id].value or {}).get("severity", ""))
+        intended_timing = str(
+            (s1[item_id].value or {}).get("postpartum_timing", "unknown")
+        )
+        required = {item_id: (intended, intended_timing)}
+        for validation_round in range(cfg["max_regen"] + 1):
+            narrative = str((s3[item_id].value or {}).get("synthetic_text", ""))
+            validation = stage4_single(item_id, narrative, cfg, usage, validation_round)
+            s4[item_id] = validation
+            outcomes[item_id]["validator_history"].append(
+                {
+                    "round": validation_round,
+                    "status": validation.status,
+                    "prediction": (validation.value or {}).get("predicted_severity", ""),
+                    "predicted_timing": (validation.value or {}).get("predicted_timing", ""),
+                    "confidence": (validation.value or {}).get("confidence", ""),
+                    "errors": validation.errors,
+                }
+            )
+            if validation.status != "ok" or validation.value is None:
+                outcomes[item_id]["row_status"] = "validator_failed"
+                break
+            severity_matches = validation.value.get("predicted_severity") == intended
+            timing_matches = (
+                not cfg["use_timing"]
+                or intended_timing == "unknown"
+                or validation.value.get("predicted_timing") == intended_timing
+            )
+            if severity_matches and timing_matches:
+                outcomes[item_id]["row_status"] = "accepted"
+                break
+            if validation_round >= cfg["max_regen"]:
+                if not severity_matches and not timing_matches:
+                    outcomes[item_id]["row_status"] = "rejected_severity_and_timing_mismatch"
+                elif not severity_matches:
+                    outcomes[item_id]["row_status"] = "rejected_severity_mismatch"
+                else:
+                    outcomes[item_id]["row_status"] = "rejected_timing_mismatch"
+                break
+
+            outcomes[item_id]["regen_count"] += 1
+            regenerated = generate_direct_baseline(
+                ids=[item_id],
+                records=records,
+                cfg=cfg,
+                usage=usage,
+                regeneration_attempt=validation_round + 1,
+                validator_feedback={
+                    item_id: {
+                        "predicted_severity": validation.value.get("predicted_severity"),
+                        "required_severity": intended,
+                        "predicted_timing": validation.value.get("predicted_timing"),
+                        "required_timing": intended_timing,
+                    }
+                },
+                required_targets=required,
+            )
+            new_s1, new_s2, new_s3 = split_direct_results([item_id], regenerated)
+            audit_direct_grounding(
+                ids=[item_id],
+                s1=new_s1,
+                s2=new_s2,
+                s3=new_s3,
+                cfg=cfg,
+                usage=usage,
+                regeneration_attempt=validation_round + 1,
+            )
+            for old, new in (
+                (s1[item_id], new_s1[item_id]),
+                (s2[item_id], new_s2[item_id]),
+                (s3[item_id], new_s3[item_id]),
+            ):
+                new.attempts += old.attempts
+                new.errors = old.errors + new.errors
+            s1[item_id] = new_s1[item_id]
+            s2[item_id] = new_s2[item_id]
+            s3[item_id] = new_s3[item_id]
+            if s3[item_id].status != "ok" or s3[item_id].value is None:
+                outcomes[item_id]["row_status"] = "regen_failed"
+                break
+
+    return s1, s2, s3, s4, outcomes
+
+
 def last_error(result: ItemResult) -> str:
     if result.status in {"ok", "skipped"}:
         return ""
@@ -2577,21 +3198,44 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
         item_id: ItemResult(status="not_run", errors=[record["source_eligibility_reason"]])
         for item_id, record in records.items()
     }
-    if eligible_records:
+    s2 = {
+        item_id: ItemResult(status="not_run", errors=[record["source_eligibility_reason"]])
+        for item_id, record in records.items()
+    }
+    s3 = {
+        item_id: ItemResult(status="not_run", errors=[record["source_eligibility_reason"]])
+        for item_id, record in records.items()
+    }
+    s4 = {
+        item_id: ItemResult(status="not_run", errors=[record["source_eligibility_reason"]])
+        for item_id, record in records.items()
+    }
+    outcomes = {
+        item_id: {"row_status": "failed", "regen_count": 0, "validator_history": []}
+        for item_id in records
+    }
+    if eligible_records and cfg["pipeline_mode"] == "direct":
+        direct_s1, direct_s2, direct_s3, direct_s4, direct_outcomes = direct_stages_and4(
+            records=eligible_records, cfg=cfg, usage=usage
+        )
+        s1.update(direct_s1)
+        s2.update(direct_s2)
+        s3.update(direct_s3)
+        s4.update(direct_s4)
+        outcomes.update(direct_outcomes)
+    elif eligible_records:
         s1.update(stage1(eligible_records, cfg, usage))
-    s2 = stage2(s1, cfg, usage)
-    for item_id, record in records.items():
-        if record["source_eligibility"] != "eligible":
-            s2[item_id] = ItemResult(
-                status="not_run", errors=[record["source_eligibility_reason"]]
-            )
-    s3, s4, outcomes = stages3_and4(
-        records=records,
-        stage1_results=s1,
-        stage2_results=s2,
-        cfg=cfg,
-        usage=usage,
-    )
+        s2.update(stage2(s1, cfg, usage))
+        staged_s3, staged_s4, staged_outcomes = stages3_and4(
+            records=records,
+            stage1_results=s1,
+            stage2_results=s2,
+            cfg=cfg,
+            usage=usage,
+        )
+        s3.update(staged_s3)
+        s4.update(staged_s4)
+        outcomes.update(staged_outcomes)
     for item_id, record in records.items():
         if record["source_eligibility"] != "eligible":
             reason = record["source_eligibility_reason"]
@@ -2611,11 +3255,13 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
         predicted = str(validation.get("predicted_severity", ""))
         timing = str(factors.get("postpartum_timing", ""))
         predicted_timing = str(validation.get("predicted_timing", ""))
+        required_min_words, required_max_words = narrative_word_bounds(factors, cfg)
         row = record["input"]
         rows.append(
             {
                 "source_index": item_id,
                 "batch_id": batch_id,
+                "pipeline_mode": cfg["pipeline_mode"],
                 "source_post": source,
                 "source_label": row.get(cfg["label_column"], "") if cfg["label_column"] else "",
                 "source_category": row.get(cfg["category_column"], "") if cfg["category_column"] else "",
@@ -2651,11 +3297,14 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
                 "s3_status": s3[item_id].status,
                 "s3_attempts": s3[item_id].attempts,
                 "s3_error": last_error(s3[item_id]),
+                "s3_recovery_errors": s3[item_id].errors,
                 "s3_text": text or FAILED_SENTINEL,
                 "s3_target": generated.get("target", ""),
                 "s3_timing": generated.get("timing", ""),
                 "s3_style": generated.get("style", ""),
                 "s3_word_count": word_count(text),
+                "s3_required_min_words": required_min_words,
+                "s3_required_max_words": required_max_words,
                 "s3_identifier_leaks": identifier_leaks(text),
                 "s3_shared_source_ngrams": shared_ngram_count(source, text, cfg["copy_ngram_size"]),
                 "s3_unsupported_detail_flags": unsupported_detail_categories(text, factors),
@@ -2742,6 +3391,8 @@ def manifest_config(args: argparse.Namespace, selected_count: int) -> dict[str, 
         "sentiment_column": args.sentiment_column,
         "ollama_host": args.ollama_host,
         "ollama_model": args.ollama_model,
+        "ollama_thinking": args.ollama_thinking,
+        "pipeline_mode": args.pipeline_mode,
         "workers": args.workers,
         "batch_size": args.batch_size,
         "schema_retries": args.schema_retries,
@@ -2752,6 +3403,7 @@ def manifest_config(args: argparse.Namespace, selected_count: int) -> dict[str, 
         "use_timing": not args.no_timing,
         "use_validator": not args.no_validator,
         "use_source_screen": not args.no_source_screen,
+        "use_adaptive_length": not args.no_adaptive_length,
         "max_regen": args.max_regen,
         "temp_s1": args.temp_s1,
         "temp_s2": args.temp_s2,
@@ -2761,11 +3413,15 @@ def manifest_config(args: argparse.Namespace, selected_count: int) -> dict[str, 
         "tokens_s2_per_item": args.tokens_s2_per_item,
         "tokens_s3_per_item": args.tokens_s3_per_item,
         "tokens_s4_per_item": args.tokens_s4_per_item,
+        "tokens_direct_per_item": args.tokens_direct_per_item,
         "top_p": args.top_p,
         "top_k": args.top_k,
         "repeat_penalty": args.repeat_penalty,
         "min_words": args.min_words,
         "max_words": args.max_words,
+        "sparse_min_words": args.sparse_min_words,
+        "sparse_target_max_words": args.sparse_target_max_words,
+        "sparse_max_words": args.sparse_max_words,
         "copy_ngram_size": args.copy_ngram_size,
         "max_copy_ngrams": args.max_copy_ngrams,
         "timing_buckets": list(TIMING_BUCKETS),
@@ -2888,6 +3544,7 @@ def merge_batches(
         return round(100.0 * count / denominator, 2) if denominator else None
 
     summary = {
+        "pipeline_mode": cfg["pipeline_mode"],
         "total_rows": total,
         "eligible_rows": eligible_total,
         "excluded_source_rows": len(excluded_rows),
@@ -2981,6 +3638,7 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         "--tokens-s2-per-item": args.tokens_s2_per_item,
         "--tokens-s3-per-item": args.tokens_s3_per_item,
         "--tokens-s4-per-item": args.tokens_s4_per_item,
+        "--tokens-direct-per-item": args.tokens_direct_per_item,
         "--copy-ngram-size": args.copy_ngram_size,
     }
     for name, value in positive.items():
@@ -2996,6 +3654,17 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--top-p must be between 0 and 1")
     if args.min_words < 1 or args.max_words < args.min_words:
         parser.error("word limits must satisfy 1 <= --min-words <= --max-words")
+    if (
+        args.sparse_min_words < 1
+        or args.sparse_target_max_words < args.sparse_min_words
+        or args.sparse_max_words < args.sparse_target_max_words
+        or args.sparse_max_words < args.sparse_min_words
+        or args.sparse_max_words > args.max_words
+    ):
+        parser.error(
+            "sparse limits must satisfy 1 <= --sparse-min-words <= "
+            "--sparse-target-max-words <= --sparse-max-words <= --max-words"
+        )
     if args.workers > 1 and args.limit_rows and args.limit_rows <= 100:
         print("NOTE: --workers 1 is usually fastest and safest for CPU-only Ollama.", file=sys.stderr)
 
@@ -3004,14 +3673,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Canonical four-stage PPD generator. Safe defaults process 100 rows on "
-            "one CPU-friendly worker; use --limit-rows 0 deliberately for all rows."
+            "PPD generator with canonical four-stage and direct one-prompt modes. "
+            "Safe defaults process 100 rows on one CPU-friendly worker."
         ),
     )
     parser.add_argument("--input", required=True, help="Source CSV")
     parser.add_argument("--outdir", required=True, help="Fresh run directory, or same directory to resume")
     parser.add_argument("--ollama-model", required=True, help="Exact pulled Ollama model tag")
     parser.add_argument("--ollama-host", default=OLLAMA_HOST_DEFAULT)
+    parser.add_argument(
+        "--ollama-thinking",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Control reasoning output for thinking-capable Ollama models",
+    )
+    parser.add_argument(
+        "--pipeline-mode",
+        choices=("four-stage", "direct"),
+        default="four-stage",
+        help="Generation architecture; direct is the one-prompt comparison baseline",
+    )
     parser.add_argument("--text-column", default="Post")
     parser.add_argument("--label-column", default="Label")
     parser.add_argument("--category-column", default="Category")
@@ -3041,11 +3722,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokens-s2-per-item", type=int, default=120)
     parser.add_argument("--tokens-s3-per-item", type=int, default=520)
     parser.add_argument("--tokens-s4-per-item", type=int, default=220)
+    parser.add_argument("--tokens-direct-per-item", type=int, default=1000)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--repeat-penalty", type=float, default=1.15)
     parser.add_argument("--min-words", type=int, default=30)
     parser.add_argument("--max-words", type=int, default=100)
+    parser.add_argument(
+        "--no-adaptive-length",
+        action="store_true",
+        help="Ablation: use the global word range even for sparse factors",
+    )
+    parser.add_argument("--sparse-min-words", type=int, default=20)
+    parser.add_argument("--sparse-target-max-words", type=int, default=45)
+    parser.add_argument("--sparse-max-words", type=int, default=65)
     parser.add_argument("--copy-ngram-size", type=int, default=8)
     parser.add_argument("--max-copy-ngrams", type=int, default=0)
     parser.add_argument("--max-rejection-rate", type=float, default=0.05)
@@ -3114,6 +3804,7 @@ def main() -> int:
         f"request_timeout={args.request_timeout}s",
         log_file,
     )
+    log(f"Pipeline mode: {args.pipeline_mode}", log_file)
     log(f"Private output directory: {outdir}", log_file)
     log("=" * 72, log_file)
 
@@ -3128,7 +3819,8 @@ def main() -> int:
         if eligible_in_batch:
             pending_eligible_batches += 1
             pending_eligible_rows += eligible_in_batch
-    minimum_calls = pending_eligible_batches * 4 + (
+    grouped_calls = 2 if args.pipeline_mode == "direct" else 4
+    minimum_calls = pending_eligible_batches * grouped_calls + (
         pending_eligible_rows if not args.no_validator else 0
     )
     log(
@@ -3143,6 +3835,8 @@ def main() -> int:
     cfg = {
         "model": args.ollama_model,
         "ollama_host": args.ollama_host,
+        "ollama_thinking": args.ollama_thinking,
+        "pipeline_mode": args.pipeline_mode,
         "workers": args.workers,
         "schema_retries": args.schema_retries,
         "transport_retries": args.transport_retries,
@@ -3152,6 +3846,7 @@ def main() -> int:
         "use_timing": not args.no_timing,
         "use_validator": not args.no_validator,
         "use_source_screen": not args.no_source_screen,
+        "use_adaptive_length": not args.no_adaptive_length,
         "max_regen": args.max_regen,
         "temp_s1": args.temp_s1,
         "temp_s2": args.temp_s2,
@@ -3161,11 +3856,15 @@ def main() -> int:
         "tokens_s2_per_item": args.tokens_s2_per_item,
         "tokens_s3_per_item": args.tokens_s3_per_item,
         "tokens_s4_per_item": args.tokens_s4_per_item,
+        "tokens_direct_per_item": args.tokens_direct_per_item,
         "top_p": args.top_p,
         "top_k": args.top_k,
         "repeat_penalty": args.repeat_penalty,
         "min_words": args.min_words,
         "max_words": args.max_words,
+        "sparse_min_words": args.sparse_min_words,
+        "sparse_target_max_words": args.sparse_target_max_words,
+        "sparse_max_words": args.sparse_max_words,
         "copy_ngram_size": args.copy_ngram_size,
         "max_copy_ngrams": args.max_copy_ngrams,
         "text_column": args.text_column,
