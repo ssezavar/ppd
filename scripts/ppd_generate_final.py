@@ -42,7 +42,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-SCRIPT_VERSION = "ppd_generate_final v4.25"
+SCRIPT_VERSION = "ppd_generate_final v4.50"
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 FAILED_SENTINEL = "[GENERATION_FAILED]"
 
@@ -57,7 +57,32 @@ TIMING_BUCKETS = (
 )
 TIMING_SET = set(TIMING_BUCKETS)
 INTENSITIES = {"low", "moderate", "high"}
-STAGE3_SENTENCE_COUNT = 4
+STAGE3_SENTENCE_COUNT = 3
+
+_RISK_NEGATION_PREFIX = re.compile(
+    r"(?:\bnever(?:\s+\w+){0,6}|"
+    r"\b(?:do|does|did|would|could|have|has|had|was|were) not(?:\s+\w+){0,6}|"
+    r"\b(?:don't|doesn't|didn't|wouldn't|couldn't|haven't|hasn't|hadn't)(?:\s+\w+){0,6}|"
+    r"\bno (?:thoughts?|ideas?|plans?|intentions?)(?:\s+\w+){0,4}|"
+    r"\bwithout (?:any )?(?:thoughts?|ideas?|plans?|intentions?)(?:\s+\w+){0,4}|"
+    r"\bden(?:y|ied|ies|ying)(?:\s+\w+){0,6})\s*$",
+    re.I,
+)
+_SELF_HARM_PATTERN = re.compile(
+    r"\b(?:take my life|end my life|kill myself|suicid\w*|self[- ]?harm|"
+    r"harm(?:ing|ed)? myself|hurt(?:ing|ed)? myself|want(?:ed)? to die)\b",
+    re.I,
+)
+_THIRD_PERSON_NARRATIVE_PATTERN = re.compile(
+    r"\b(?:the individual|the mother|she|they)\b",
+    re.I,
+)
+_INFANT_HARM_PATTERN = re.compile(
+    r"\b(?:take|end) (?:my )?(?:baby|infant|child)(?:'s)? life\b|"
+    r"\bharm(?:ing)? (?:my |the )?(?:baby|infant|child)\b|"
+    r"\b(?:take|end|contemplat\w*).{0,80}\b(?:baby|infant|child)(?:'s)? life\b",
+    re.I,
+)
 
 LOG_LOCK = threading.Lock()
 
@@ -123,6 +148,7 @@ _TIMING_NARRATIVE_CUES = {
 }
 _IMPLIED_TIMING_CUE = re.compile(
     r"\b(?:newborn|early postpartum|early days|first weeks|"
+    r"within (?:the )?first (?:few )?weeks|"
     r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|a few|several) "
     r"(?:days|weeks|months) (?:after|since) (?:birth|delivery|giving birth)|"
     r"just (?:gave birth|delivered))\b",
@@ -145,42 +171,60 @@ def source_timing_bucket(source_text: str) -> str:
         "eleven": 11.0, "twelve": 12.0,
     }
     number = r"(?:\d+(?:\.\d+)?|a|one|two|couple|three|few|four|several|five|six|seven|eight|nine|ten|eleven|twelve)"
+    unit = r"(?:days?|d|weeks?|wks?|months?|mos?|years?|yrs?)"
     patterns = (
         re.compile(
             rf"\b(?:baby|infant|child)(?:\s+is|'s)?\s+(?P<n>{number})\s*"
-            r"(?P<u>days?|weeks?|months?)(?:\s*[- ]?old)?\b",
+            rf"(?P<u>{unit})(?:\s*[- ]?old)?\b",
             re.I,
         ),
         re.compile(
-            rf"\b(?P<n>{number})\s*(?P<u>days?|weeks?|months?)\s*"
+            rf"\b(?P<n>{number})\s*(?P<u>{unit})\s*"
             r"(?:postpartum\b|(?:after|since)\s*(?:birth|delivery|giving birth|having (?:a|my) baby)\b)",
             re.I,
         ),
         re.compile(
             rf"\b(?:gave birth|delivered|had (?:a|my(?: (?:\d+(?:st|nd|rd|th)|first|second|third|fourth))?) baby)\s+"
             rf"(?:almost|about|around)?\s*(?P<n>{number})\s*"
-            r"(?P<u>days?|weeks?|months?)\s+ago\b",
+            rf"(?P<u>{unit})\s+ago\b",
             re.I,
         ),
     )
     later_match = re.search(
-        rf"\b(?P<n>{number})\s*(?P<u>days?|weeks?|months?)\s+later\b",
+        rf"\b(?P<n>{number})\s*(?P<u>{unit})\s+later\b",
         source_text or "",
         re.I,
     )
     has_birth_context = bool(re.search(
-        r"\b(?:baby|birth|gave birth|delivered|postpartum)\b", source_text or "", re.I
+        r"\b(?:baby|birth|gave birth|delivered|postpartum|ppd|baby blues|pediatrician)\b",
+        source_text or "",
+        re.I,
     ))
     match = later_match if later_match and has_birth_context else next(
         (pattern.search(source_text or "") for pattern in patterns if pattern.search(source_text or "")),
         None,
     )
+    if match is None and has_birth_context:
+        # 2026-09-04: short posts often state timing as a visit or checkup age.
+        match = re.search(
+            rf"\b(?:at\s+)?(?P<n>{number})\s*(?P<u>{unit})\s*"
+            r"(?:check\s*up|for\s+(?:postpartum\s+)?depress\w*|when\s+i\s+sought\s+help)\b",
+            source_text or "",
+            re.I,
+        )
     if match is None:
         return "unknown"
     raw_number = match.group("n").lower()
     value = float(raw_number) if re.fullmatch(r"\d+(?:\.\d+)?", raw_number) else number_words[raw_number]
     unit = match.group("u").lower()
-    weeks = value / 7.0 if unit.startswith("day") else value * 4.0 if unit.startswith("month") else value
+    if unit.startswith("day") or unit == "d":
+        weeks = value / 7.0
+    elif unit.startswith("month") or unit.startswith("mo"):
+        weeks = value * 4.0
+    elif unit.startswith("year") or unit.startswith("yr"):
+        weeks = value * 52.0
+    else:
+        weeks = value
     if weeks <= 2:
         return TIMING_BUCKETS[0]
     if weeks <= 6:
@@ -222,18 +266,19 @@ def source_has_affirmed_risk(source_text: str, pattern: re.Pattern[str]) -> bool
     source = re.sub(r"\s+", " ", source_text or "").lower()
     for match in pattern.finditer(source):
         prefix = source[max(0, match.start() - 80):match.start()]
-        if re.search(
-            r"(?:\bnever(?:\s+\w+){0,6}|"
-            r"\b(?:do|does|did|would|could|have|has|had|was|were) not(?:\s+\w+){0,6}|"
-            r"\b(?:don't|doesn't|didn't|wouldn't|couldn't|haven't|hasn't|hadn't)(?:\s+\w+){0,6}|"
-            r"\bno (?:thoughts?|ideas?|plans?|intentions?)(?:\s+\w+){0,4}|"
-            r"\bwithout (?:any )?(?:thoughts?|ideas?|plans?|intentions?)(?:\s+\w+){0,4}|"
-            r"\bden(?:y|ied|ies|ying)(?:\s+\w+){0,6})\s*$",
-            prefix,
-            re.I,
-        ):
+        if _RISK_NEGATION_PREFIX.search(prefix):
             continue
         return True
+    return False
+
+
+def source_has_denied_risk(source_text: str, pattern: re.Pattern[str]) -> bool:
+    """Retain an explicit safety denial without converting it into risk."""
+    source = re.sub(r"\s+", " ", source_text or "").lower()
+    for match in pattern.finditer(source):
+        prefix = source[max(0, match.start() - 80):match.start()]
+        if _RISK_NEGATION_PREFIX.search(prefix):
+            return True
     return False
 
 
@@ -303,16 +348,29 @@ def calibrate_blind_severity(text: str, predicted: str) -> str:
     intensity = ""
     if intensity_match:
         intensity = next(group for group in intensity_match.groups() if group).lower()
+    if not intensity:
+        natural_intensity = re.search(
+            r"\b(mild|moderate|severe|intense)\s+"
+            r"(?:depress\w*|anxi\w*|symptoms?|distress|feelings?)\b",
+            value,
+            re.I,
+        )
+        if natural_intensity:
+            intensity = {
+                "mild": "low", "moderate": "moderate", "severe": "high", "intense": "high",
+            }[natural_intensity.group(1).lower()]
     persistent = bool(re.search(
         r"\b(?:persistent|persisted|ongoing|constant|continuous|sustained|daily|"
-        r"every day|keeps? returning|does not go away|doesn't go away)\b",
+        r"every day|keeps? returning|does not go away|doesn't go away|"
+        r"continue(?:s|d)? to|has continued|have continued|i have been|i've been|"
+        r"all along|still (?:deal\w*|work\w*|feel\w*|experience\w*))\b",
         value,
         re.I,
     ))
     value_lower = value.lower()
     persistent = persistent or any(
         phrase in value_lower
-        for phrase in ("each day", "every day", "still struggling", "continues to")
+        for phrase in ("each day", "every day", "still struggling", "continue to", "continues to")
     )
     natural_distress = bool(re.search(
         r"\b(?:depress\w*|distress\w*|struggl\w*|difficult|significant(?:ly)?|"
@@ -332,12 +390,25 @@ def calibrate_blind_severity(text: str, predicted: str) -> str:
         value,
         re.I,
     ))
-    bonding_or_risk = bool(_SUPPORTED_DETAIL_PATTERNS["high-risk/bonding detail"].search(value))
+    bonding_disruption = bool(re.search(
+        r"\b(?:unable to (?:bond|connect)|cannot (?:bond|connect)|can't (?:bond|connect)|"
+        r"bonding feels|feel(?:ing)? detached|feel(?:ing)? disconnected)\b",
+        value,
+        re.I,
+    ))
+    affirmed_risk = (
+        source_has_affirmed_risk(value, _SELF_HARM_PATTERN)
+        or source_has_affirmed_risk(value, _INFANT_HARM_PATTERN)
+    )
+    bonding_or_risk = bonding_disruption or affirmed_risk
     resolved = bool(re.search(r"\b(?:resolved|recovered|improved|no longer present)\b", value, re.I))
-    moderate_gate = (
-        persistent and (intensity in {"moderate", "high"} or natural_distress)
+    moderate_gate = intensity == "high" or (
+        persistent and (
+            intensity in {"moderate", "high"} or (not intensity and natural_distress)
+        )
     ) or impairment or bonding_or_risk
     severe_gate = intensity == "high" and (impairment or bonding_or_risk)
+    # 2026-09-04: explicit high intensity plus risk satisfies the Severe boundary.
     if severe_gate:
         return "Severe"
     if moderate_gate:
@@ -456,15 +527,57 @@ def word_count(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text or "", flags=re.UNICODE))
 
 
-def materialize_stage3_text(item: dict[str, Any]) -> str:
-    """Join structured sentence or paragraph slots into the narrative field."""
+def stage3_sentence_values(item: dict[str, Any]) -> list[str]:
+    """Normalize harmless Stage-3 sentence layouts from small local models."""
     sentences = item.get("sentences")
     sentence_values: list[Any] = []
     if isinstance(sentences, dict):
         sentence_values = [sentences[key] for key in sorted(sentences)]
     elif isinstance(sentences, list):
         sentence_values = sentences
-    cleaned_sentences = [str(value).strip() for value in sentence_values if str(value).strip()]
+    elif isinstance(item.get("synthetic_text"), str):
+        sentence_values = [item["synthetic_text"]]
+
+    cleaned_sentences: list[str] = []
+    for value in sentence_values:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not normalized:
+            continue
+        parts = re.split(r"(?<=[.!?])\s+(?=[\"']?[A-ZI])", normalized)
+        cleaned_sentences.extend(part.strip() for part in parts if part.strip())
+    if cleaned_sentences:
+        item["sentences"] = cleaned_sentences
+    return cleaned_sentences
+
+
+def normalize_stage3_language(item: dict[str, Any]) -> None:
+    """Clean a few harmless local-model phrasing errors before validation."""
+    sentences = stage3_sentence_values(item)
+    replacements = (
+        (r"\bI felt supported by strong support from\b", "I felt strongly supported by"),
+        (r"\bI feel supported by strong support from\b", "I feel strongly supported by"),
+        (r"\bI am supported by strong support from\b", "I am strongly supported by"),
+        (r"\bAt the moment, I had\b", "At that time, I had"),
+        (r"\bat after giving birth\b", "after giving birth"),
+    )
+    cleaned: list[str] = []
+    changed = False
+    for sentence in sentences:
+        value = sentence
+        for pattern, replacement in replacements:
+            value = re.sub(pattern, replacement, value, flags=re.I)
+        if value and not re.search(r"[.!?][\"']?$", value):
+            value += "."
+        changed = changed or value != sentence
+        cleaned.append(value)
+    if changed:
+        item["sentences"] = cleaned
+        item["language_normalized"] = True
+
+
+def materialize_stage3_text(item: dict[str, Any]) -> str:
+    """Join structured sentence or paragraph slots into the narrative field."""
+    cleaned_sentences = stage3_sentence_values(item)
     if cleaned_sentences:
         group_size = 2 if len(cleaned_sentences) <= STAGE3_SENTENCE_COUNT else 4
         paragraphs = [
@@ -529,19 +642,39 @@ _GROUNDING_STOPWORDS = {
     "a", "an", "and", "as", "at", "be", "been", "being", "but", "by",
     "for", "from", "has", "have", "i", "in", "is", "it", "me", "my",
     "of", "on", "that", "the", "these", "this", "to", "was", "with",
+    "after", "birth", "during", "experience", "experiencing", "experienced",
+    "feel", "feeling", "feelings", "individual", "mother", "new", "parent",
+    "person", "postpartum", "time", "times", "challenging", "difficult",
+    "about", "able", "company", "despite", "giving", "had", "i'm", "i've", "it's", "made",
+    "makes", "moments", "notice", "noticed", "quality", "some", "spend", "things", "think",
+    "through", "together", "trouble", "twice", "went", "will",
 }
 
 
 def grounding_tokens(text: str) -> set[str]:
     aliases = {
-        "noticed": "recognize", "notice": "recognize", "realized": "recognize",
+        "realized": "recognize",
         "realize": "recognize", "recognized": "recognize", "recognise": "recognize",
         "changes": "change", "changed": "change", "changing": "change",
         "struggling": "difficult", "struggle": "difficult", "hard": "difficult",
         "persistent": "ongoing", "persisting": "ongoing",
+        "high": "intense", "severe": "intense", "strong": "intense",
+        "supported": "support", "supportive": "support",
+        "friends": "friend",
+        "depressed": "depression", "down": "depression",
+        "anxious": "anxiety", "worried": "worry",
+        "abilities": "ability", "children": "child", "infant": "child",
+        "babies": "child", "baby": "child", "recovered": "recover",
+        "overcame": "recover", "overcome": "recover",
+        "enjoying": "enjoy", "lately": "ongoing", "needed": "need",
+        "needs": "need", "still": "ongoing", "uncertainty": "uncertain",
+        "intake": "consumption", "mood": "depression", "reduced": "reduce",
+        "reducing": "reduce",
     }
     tokens = set()
     for token in normalized_tokens(text):
+        if token.endswith("'s"):
+            token = token[:-2]
         token = aliases.get(token, token)
         if token not in _GROUNDING_STOPWORDS and len(token) > 2:
             tokens.add(token)
@@ -557,8 +690,24 @@ def reconcile_grounding_assessment(
     remaining = []
     reconciled = []
     for claim in claims:
-        overlap = grounding_tokens(claim) & factor_tokens
-        if len(overlap) >= 2:
+        claim_tokens = grounding_tokens(claim)
+        overlap = claim_tokens & factor_tokens
+        coverage = len(overlap) / max(1, len(claim_tokens))
+        has_sensitive_addition = bool(unsupported_detail_categories(claim, factors))
+        has_meta_language = bool(
+            _META_NARRATIVE_PATTERN.search(claim)
+            or _MISSINGNESS_NARRATIVE_PATTERN.search(claim)
+        )
+        safe_reflection = bool(
+            re.search(r"\b(?:those(?: same)?|the same) (?:feelings|emotions)\b", claim, re.I)
+            and factors.get("symptoms")
+        )
+        minimum_overlap = 1 if len(claim_tokens) <= 2 else 2
+        if (
+            (safe_reflection or (len(overlap) >= minimum_overlap and coverage >= (2 / 3)))
+            and not has_sensitive_addition
+            and not has_meta_language
+        ):
             reconciled.append(claim)
         else:
             remaining.append(claim)
@@ -610,6 +759,39 @@ def preserve_explicit_source_factors(item: dict[str, Any], source_text: str) -> 
         }[explicit_intensity.group("level")]
 
 
+def source_supported_intensity(source_text: str, risk_indicators: Sequence[str]) -> str:
+    """Assign intensity from explicit wording instead of model inference."""
+    source = re.sub(r"\s+", " ", source_text or "").lower()
+    if risk_indicators:
+        return "high"
+    explicit = re.search(
+        r"\b(?P<level>mild|moderate|severe)\s+(?:postpartum\s+)?"
+        r"(?:depress\w*|anxi\w*|symptoms?|distress)\b",
+        source,
+    )
+    if explicit:
+        return {
+            "mild": "low", "moderate": "moderate", "severe": "high",
+        }[explicit.group("level")]
+    if re.search(
+        r"\b(?:really|very|extremely)\W{0,3}\s*bad\s+(?:depress\w*|anxi\w*)|"
+        r"\b(?:intense|overwhelming|debilitating|crippling)\s+"
+        r"(?:depress\w*|anxi\w*|symptoms?|distress)|"
+        r"\b(?:would not|wouldn't|do not|don't) know if i (?:would have )?surviv\w*|"
+        r"\bbetter off without me\b|\bunable to (?:function|care)\b|"
+        r"\b(?:disappeared|withdrew)\b.{0,35}\bfriend\w*\b",
+        source,
+    ):
+        return "high"
+    if re.search(
+        r"\b(?:depress\w*|anxi\w*|intrusive thoughts?|panic\w*|hopeless\w*|"
+        r"worthless\w*|guilt\w*|baby blues)\b",
+        source,
+    ):
+        return "moderate"
+    return "low"
+
+
 def generalize_precise_ages(item: dict[str, Any]) -> None:
     """Keep broad postpartum context without retaining exact child ages."""
     age_pattern = re.compile(
@@ -627,6 +809,27 @@ def generalize_precise_ages(item: dict[str, Any]) -> None:
                 age_pattern.sub("young", entry) if isinstance(entry, str) else entry
                 for entry in value
             ]
+
+
+def stage3_generalized_summary(summary: str) -> str:
+    """Keep Stage-3 summaries from competing with the canonical timing bucket."""
+    amount = (
+        r"(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|a few|several)"
+    )
+    duration = rf"(?:about|around|approximately|almost|nearly|over)?\s*{amount}\s+(?:days?|weeks?|months?|years?)"
+    value = re.sub(rf"\blasting\s+{duration}\b", "during the postpartum period", summary, flags=re.I)
+    value = re.sub(rf"\bsince\s+{duration}(?:\s+ago)?\b", "during the postpartum period", value, flags=re.I)
+    value = re.sub(rf"\buntil\s+{duration}\b", "until later", value, flags=re.I)
+    # Intensity is carried separately so the surface model cannot overread one adjective.
+    value = re.sub(
+        r"\b(?:mild|moderate|severe|intense)\s+(?=(?:postpartum\s+)?"
+        r"(?:depress\w*|anxi\w*|symptoms?|distress)\b)",
+        "",
+        value,
+        flags=re.I,
+    )
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def stage3_provenance(generated: dict[str, Any]) -> str:
@@ -648,11 +851,11 @@ def narrative_word_bounds(
     evidence_units = 1 if str(factors.get("deidentified_summary", "")).strip() else 0
     for key in (
         "symptoms", "functional_impact", "feeding_or_infant_care_stressors",
-        "bonding_indicators", "risk_indicators",
+        "bonding_indicators", "risk_indicators", "risk_denials",
     ):
-        evidence_units += sum(
+        evidence_units += int(any(
             bool(str(value).strip()) for value in factors.get(key, [])
-        )
+        ))
     for key in (
         "symptom_persistence", "sleep_context", "perceived_support",
         "coping_or_adjustment_context",
@@ -682,122 +885,205 @@ def conservative_factor_narrative(
     factors: dict[str, Any], severity: str, use_timing: bool,
     min_words: int, max_words: int, variant: int = 0,
 ) -> dict[str, Any]:
-    """Build a grounded fallback directly from validated factor fields."""
+    """Build a short, natural fallback from validated factor fields."""
     sentences: list[str] = []
     timing = str(factors.get("postpartum_timing") or "unknown")
     if use_timing and timing in _CANONICAL_TIMING_PREFIXES:
         sentences.append(_CANONICAL_TIMING_PREFIXES[timing])
 
-    symptoms = [str(value).strip() for value in factors.get("symptoms", []) if str(value).strip()]
+    symptoms = [
+        str(value).strip().lower()
+        for value in factors.get("symptoms", [])
+        if str(value).strip()
+    ]
+    # Risk content is narrated once from the polarity-checked risk fields.
+    symptoms = [
+        value for value in symptoms
+        if not re.search(r"\b(?:suicid\w*|self[- ]?harm|harm(?:ing)? (?:my |the )?(?:baby|infant|child))\b", value, re.I)
+    ]
+    symptom_text = ""
+    if symptoms:
+        symptom_text = symptoms[0] if len(symptoms) == 1 else ", ".join(symptoms[:-1]) + f" and {symptoms[-1]}"
     intensity = str(factors.get("symptom_intensity") or "").strip().lower()
     persistence = str(factors.get("symptom_persistence") or "").strip().lower()
     past_experience = persistence.startswith("past,")
-    if symptoms:
-        symptom_text = ", ".join(symptoms[:-1])
-        if len(symptoms) > 1:
-            symptom_text += f" and {symptoms[-1]}"
-        else:
-            symptom_text = symptoms[0]
-        resolved = persistence in {"resolved", "improved", "recovered", "no longer present"}
-        if resolved or past_experience:
-            openings = (
-                f"I previously experienced {symptom_text}",
-                f"My past experience included {symptom_text}",
-                f"I describe a past experience of {symptom_text}",
-            )
-        elif persistence == "ongoing":
-            openings = (
-                f"I am experiencing {symptom_text}",
-                f"My ongoing experience includes {symptom_text}",
-                f"I continue to experience {symptom_text}",
-            )
-        else:
-            openings = (
-                f"I describe {symptom_text} as part of my experience",
-                f"My account includes an experience of {symptom_text}",
-                f"I identify an experience of {symptom_text}",
-            )
-        detail = openings[variant % len(openings)]
-        if intensity in INTENSITIES:
-            detail += f" at {intensity} intensity"
+    resolved = persistence in {"resolved", "improved", "recovered", "no longer present"}
+    if re.search(r"\b(?:mild|moderate|severe|intense)\b", symptom_text, re.I):
+        symptom_phrase = symptom_text
+    else:
+        symptom_phrase = {
+            "low": f"mild {symptom_text}",
+            "moderate": f"difficult feelings of {symptom_text}",
+            "high": f"intense {symptom_text}",
+        }.get(intensity, symptom_text)
+
+    if symptom_text:
         if resolved:
-            detail += ", and those symptoms have resolved"
-        elif not past_experience and persistence not in {"", "unknown", "not stated", "not specified"}:
-            detail += f", and it has been {persistence}"
-        sentences.append(detail + ".")
+            templates = (
+                f"After giving birth, I went through {symptom_phrase}, but those feelings have since eased.",
+                f"I experienced {symptom_phrase} after giving birth, and those feelings later eased.",
+                f"I experienced {symptom_phrase} during my postpartum period, but it has since improved.",
+            )
+            sentences.append(templates[variant % len(templates)])
+        elif past_experience:
+            templates = (
+                f"After giving birth, I went through {symptom_phrase}.",
+                f"I experienced {symptom_phrase} as part of my life after giving birth.",
+                f"I experienced {symptom_phrase} during the postpartum period.",
+            )
+            sentences.append(templates[variant % len(templates)])
+        elif persistence == "ongoing":
+            birth_context = "" if use_timing and timing in _CANONICAL_TIMING_PREFIXES else " after giving birth"
+            if intensity == "moderate":
+                templates = (
+                    f"I continue to struggle with {symptom_text}{birth_context}, and the distress remains difficult.",
+                    f"I continue to experience {symptom_text}{birth_context}, and it remains emotionally difficult.",
+                    f"I am still dealing with {symptom_text}{birth_context}, and it remains difficult.",
+                )
+                sentences.append(templates[variant % len(templates)])
+            elif intensity == "high":
+                templates = (
+                    f"I continue to struggle with intense {symptom_text}{birth_context}.",
+                    f"I continue to experience intense {symptom_text}{birth_context}.",
+                    f"I am still experiencing intense {symptom_text}{birth_context}.",
+                )
+                sentences.append(templates[variant % len(templates)])
+            else:
+                templates = (
+                    f"I continue to deal with {symptom_phrase}{birth_context}.",
+                    f"I am still experiencing {symptom_phrase}{birth_context}.",
+                    f"I continue to experience {symptom_phrase}{birth_context}.",
+                )
+                sentences.append(templates[variant % len(templates)])
+        else:
+            templates = (
+                f"My postpartum experience includes {symptom_phrase}.",
+                f"I describe {symptom_phrase} as part of my postpartum experience.",
+                f"{symptom_phrase.capitalize()} {'are' if len(symptoms) > 1 else 'is'} part of my postpartum experience.",
+            )
+            sentences.append(templates[variant % len(templates)])
 
     summary = str(factors.get("deidentified_summary") or "")
     if re.search(r"\b(?:unaware|did not (?:realize|recognize))\b", summary, re.I):
-        sentences.append("I did not recognize this experience at first.")
+        sentences.append("I did not recognize what I was experiencing at first.")
     if re.search(r"\bemotional and physical changes\b", summary, re.I):
-        sentences.append("I recognize emotional and physical changes following childbirth.")
+        sentences.append("I noticed emotional and physical changes after giving birth.")
 
-    context_fields = (
-        ("functional_impact", "I experience this functional impact: {}."),
-        ("feeding_or_infant_care_stressors", "My stated infant-care stressor is {}."),
-        ("bonding_indicators", "My bonding experience is {}."),
-        ("risk_indicators", "My stated safety concern is {}."),
-    )
-    for key, template in context_fields:
-        values = [str(value).strip() for value in factors.get(key, []) if str(value).strip()]
-        if values:
-            if key == "risk_indicators" and past_experience:
-                sentences.append(f"My past safety concerns included {'; '.join(values)}.")
-            elif key == "bonding_indicators" and values == ["positive bonding experience"]:
-                sentences.append("I feel a positive bond with my baby.")
-            else:
-                sentences.append(template.format("; ".join(values)))
+    impacts = [str(value).strip() for value in factors.get("functional_impact", []) if str(value).strip()]
+    for value in impacts:
+        if re.match(r"^difficulty\b", value, re.I):
+            sentences.append(f"I had {value.lower()}.")
+        else:
+            sentences.append(f"My experience affected {value.lower()}.")
 
-    for key, template in (
-        ("sleep_context", "My stated sleep context is {}."),
-        ("perceived_support", "My stated support experience is {}."),
-    ):
-        value = str(factors.get(key) or "").strip()
-        if value.lower() not in {"", "unknown", "not stated", "not specified"}:
-            if key == "perceived_support" and past_experience:
-                sentences.append(f"At that time, my support experience was {value}.")
+    care = [
+        str(value).strip()
+        for value in factors.get("feeding_or_infant_care_stressors", [])
+        if str(value).strip()
+    ]
+    for value in care:
+        sentences.append(f"I also faced {value.lower()}.")
+
+    bonding = [str(value).strip() for value in factors.get("bonding_indicators", []) if str(value).strip()]
+    if bonding == ["positive bonding experience"]:
+        sentences.append("I felt a positive bond with my baby.")
+    elif bonding == ["positive interaction with baby"]:
+        sentences.append("I was able to hold my baby.")
+    elif bonding:
+        sentences.append(f"I experienced {' and '.join(bonding).lower()}.")
+
+    risk = [str(value).strip() for value in factors.get("risk_indicators", []) if str(value).strip()]
+    if risk:
+        self_harm = any("self-harm" in value.lower() for value in risk)
+        infant_harm = any("harming my baby" in value.lower() for value in risk)
+        if self_harm and infant_harm:
+            joined = "thoughts of harming myself and my baby"
+        elif self_harm:
+            joined = "thoughts of harming myself"
+        elif infant_harm:
+            joined = "thoughts of harming my baby"
+        else:
+            joined = " and ".join(risk).lower()
+        if past_experience or resolved:
+            sentences.append(f"At that time, I experienced {joined}.")
+        elif persistence == "ongoing":
+            sentences.append(f"I am currently experiencing {joined}.")
+        else:
+            sentences.append(f"My postpartum experience included {joined}.")
+
+    denials = [str(value).strip() for value in factors.get("risk_denials", []) if str(value).strip()]
+    if "denied thoughts of self-harm" in denials:
+        sentences.append("I did not have thoughts of harming myself.")
+    if "denied thoughts of harming my baby" in denials:
+        sentences.append("I did not have thoughts of harming my baby.")
+
+    support = str(factors.get("perceived_support") or "").strip()
+    if support.lower() not in {"", "unknown", "not stated", "not specified"}:
+        if re.search(r"strong support from friends and family", support, re.I):
+            sentences.append("I felt supported by friends and family.")
+        elif re.search(r"\b(?:lack of|limited|little|no) support\b|^limited$", support, re.I):
+            if past_experience or resolved:
+                sentences.append("At that time, I felt unsupported.")
             else:
-                sentences.append(template.format(value))
+                sentences.append("I have experienced limited support.")
+        elif past_experience or resolved:
+            phrase = support.lower() if support.lower().endswith("support") else f"{support.lower()} support"
+            sentences.append(f"At that time, I had {phrase}.")
+        else:
+            phrase = support.lower() if support.lower().endswith("support") else f"{support.lower()} support"
+            sentences.append(f"I have {phrase}.")
 
     coping = str(factors.get("coping_or_adjustment_context") or "").strip()
     if coping.lower() not in {"", "unknown", "not stated", "not specified"}:
-        fragment = re.sub(r"^needs\b", "need", coping, flags=re.I)
-        if re.match(r"^(?:need|want|am|feel|try|recognize|request|reached|sought|started)\b", fragment, re.I):
-            sentences.append(f"I {fragment}.")
-        else:
-            sentences.append(f"My adjustment context is {fragment}.")
+        if re.search(r"needs? time to adjust", coping, re.I):
+            tense = "needed" if past_experience or resolved else "need"
+            sentences.append(f"I {tense} time to adjust to these changes.")
+        elif re.search(r"consistent exercis\w*", coping, re.I) and re.search(
+            r"\b(?:improv\w*|help\w*|difference)\b", coping, re.I
+        ):
+            sentences.append("I exercised consistently and noticed some improvement.")
+        elif re.search(r"exercis\w*(?: more)? consistently|consistent exercis\w*", coping, re.I):
+            sentences.append("I used consistent exercise as part of coping.")
+        elif re.search(r"wanted to resume exercise", coping, re.I):
+            sentences.append("I wanted to return to exercise as part of moving forward.")
+        elif re.search(r"associated the depression with hormonal changes", coping, re.I):
+            sentences.append("I associated these feelings with hormonal changes.")
+        elif re.search(r"sought help but was told to wait", coping, re.I):
+            sentences.append("I sought help, but I was told to wait.")
+        elif re.search(r"sought therapy but did not return", coping, re.I):
+            sentences.append("I sought therapy but did not return after feeling dismissed.")
+        elif re.search(r"reached out to a mental-health professional", coping, re.I):
+            sentences.append("I reached out to a mental-health professional.")
+        elif re.search(r"clinician recognized the depression", coping, re.I):
+            sentences.append("A clinician recognized my depression during an infant checkup.")
+        elif re.search(r"reduced alcohol consumption", coping, re.I):
+            sentences.append("I reduced my alcohol consumption.")
+        elif re.search(r"symptoms paused long enough to care", coping, re.I):
+            sentences.append("My symptoms paused long enough for me to care for my baby.")
 
-    # Keep sparse rows faithful by repeating only explicit categorical facts.
-    if word_count(" ".join(sentences)) < min_words and symptoms:
-        if resolved or past_experience:
-            repeat_templates = (
-                "I identify {} as part of my past experience.",
-                "These reported symptoms belong to my past experience: {}.",
-                "My account places {} in a past period of my life.",
+    # One faithful reflective sentence is safer than padding with new facts.
+    if word_count(" ".join(sentences)) < min_words and symptom_text:
+        if past_experience or resolved:
+            reflections = (
+                "Looking back, those feelings were part of my emotional experience after giving birth.",
+                "I remember those emotions as an important part of that postpartum period.",
+                "Those feelings belonged to the postpartum experience I went through at that time.",
             )
+            sentences.append(reflections[variant % len(reflections)])
         elif persistence == "ongoing":
-            repeat_templates = (
-                "I identify {} as part of my ongoing experience.",
-                "These symptoms remain part of my experience: {}.",
-                "My ongoing account includes {}.",
+            reflections = (
+                "Those same emotions continue to be part of what I am experiencing postpartum.",
+                "I am still working through the same emotional experience after giving birth.",
+                "This remains part of the emotional experience I am having postpartum.",
             )
+            sentences.append(reflections[variant % len(reflections)])
         else:
-            repeat_templates = (
-                "I identify {} among the symptoms I have described.",
-                "The symptoms in my account include {}.",
-                "My description of this experience includes {}.",
+            reflections = (
+                "I am describing those same emotions as part of my experience after giving birth.",
+                "Those emotions are part of the postpartum experience I am describing here.",
+                "I describe the same emotional difficulty as part of my postpartum experience.",
             )
-        repeat_index = (variant // max(1, len(openings))) % len(repeat_templates)
-        sentences.append(repeat_templates[repeat_index].format(symptom_text))
-    if word_count(" ".join(sentences)) < min_words and intensity in INTENSITIES:
-        sentences.append(f"I describe the intensity of this experience as {intensity}.")
-    if (
-        word_count(" ".join(sentences)) < min_words
-        and persistence not in {"", "unknown", "not stated", "not specified"}
-    ):
-        sentences.append(f"I describe this experience as {persistence}.")
-    if word_count(" ".join(sentences)) < min_words and symptoms:
-        sentences.append(f"My stated symptom experience is {symptom_text}.")
+            sentences.append(reflections[variant % len(reflections)])
 
     selected: list[str] = []
     for sentence in sentences:
@@ -828,9 +1114,16 @@ _SUPPORTED_DETAIL_PATTERNS = {
         r"formula|bottle[- ]?feed\w*)\b",
         re.I,
     ),
+    "infant-care detail": re.compile(
+        r"\b(?:care|caring) for (?:my |the )?(?:baby|infant|child)|"
+        r"\blook(?:ing)? after (?:my |the )?(?:baby|infant|child)|"
+        r"\bresponsib\w* for another life\b",
+        re.I,
+    ),
     "high-risk/bonding detail": re.compile(
         r"\b(?:suicid\w*|self[- ]?harm|hopeless\w*|want to die|not worth living|"
-        r"end my life|better off without me|harm(?:ing)? (?:my |the )?baby|"
+        r"end my life|better off without me|harm(?:ing|ed)? myself|"
+        r"hurt(?:ing|ed)? myself|harm(?:ing)? (?:my |the )?baby|"
         r"unable to (?:care for|bond with|connect with) (?:my |the )?(?:baby|infant|child)|"
         r"cannot (?:care for|bond with|connect with)|can't (?:care for|bond with|connect with)|"
         r"bonding feels|feel(?:ing)? detached|feel(?:ing)? disconnected)\b",
@@ -845,7 +1138,7 @@ _SUPPORTED_DETAIL_PATTERNS = {
         r"household tasks|chores?|accomplish(?:ing)? tasks|complete tasks|manage tasks|"
         r"grocery shopping|cooking|unable to function|cannot function|can't function|"
         r"hard to get out of bed|basic tasks|functioning|work responsibilities|"
-        r"get through (?:the )?day|responsibilities feel)\b",
+        r"get through (?:the )?day|responsibilities feel|functional impact)\b",
         re.I,
     ),
     "social or assistance detail": re.compile(
@@ -866,14 +1159,16 @@ _SUPPORTED_DETAIL_PATTERNS = {
         re.I,
     ),
     "fatigue or exhaustion": re.compile(
-        r"\b(?:fatigu\w*|tired(?:ness)?|exhaust\w*|drained|no energy|low energy)\b", re.I
+        r"\b(?:fatigu\w*|tired(?:ness)?|exhaust\w*|drained|no energy|low energy|"
+        r"energy (?:level )?(?:change\w*|problem\w*|fluctuat\w*))\b", re.I
     ),
     "appetite detail": re.compile(
         r"\b(?:appetite|not eating|eat(?:ing)? (?:too much|too little|less)|loss of appetite)\b",
         re.I,
     ),
     "concentration detail": re.compile(
-        r"\b(?:concentrat\w*|focus(?:ing)?|brain fog|forgetful\w*)\b", re.I
+        r"\b(?:concentrat\w*|focus(?:ing)?|brain fog|forgetful\w*|"
+        r"(?:mind|thinking|thoughts?) (?:feels? )?cloud\w*)\b", re.I
     ),
     "irritability or anger": re.compile(
         r"\b(?:irritab\w*|angry|anger|short[- ]tempered|snapp(?:y|ing))\b", re.I
@@ -885,6 +1180,34 @@ _SUPPORTED_DETAIL_PATTERNS = {
     ),
     "physical discomfort": re.compile(
         r"\b(?:painful|in pain|aches?|sore(?:ness)?|nausea|dizz\w*|headaches?)\b", re.I
+    ),
+    "frequency or trajectory detail": re.compile(
+        r"\b(?:throughout the day|some days|day to day|every day|daily|constantly|"
+        r"frequently|often|unchanged|remains? stable|stayed the same|"
+        r"better than (?:other|some) days|getting (?:better|worse)|"
+        r"increasingly|worsen\w*|evolv\w* over time)\b",
+        re.I,
+    ),
+    "coping or priority detail": re.compile(
+        r"\b(?:top priority|trying to cope|working to cope|push(?:ing)? through|"
+        r"holding me back|manage (?:this|my)(?: [a-z-]+)? condition|"
+        r"to manage (?:this|my)|tak(?:e|ing) care of myself|determined to)\b",
+        re.I,
+    ),
+    "causal or benefit detail": re.compile(
+        r"\b(?:help(?:ed|ing|s)? (?:me|slightly|a little)|overshadow\w*|"
+        r"made things? (?:better|worse)|because of this|as a result|"
+        r"(?:crucial|essential|key) (?:for|to))\b",
+        re.I,
+    ),
+    "new emotional appraisal": re.compile(
+        r"\b(?:hopeful|grateful|proud|confident|optimistic|relieved|encouraged)\b",
+        re.I,
+    ),
+    "expectation or comparison detail": re.compile(
+        r"\b(?:more|less|harder|easier|better|worse)\b.{0,25}\bthan (?:i )?"
+        r"(?:anticipated|expected)|\bnot what i (?:anticipated|expected)\b",
+        re.I,
     ),
 }
 
@@ -921,7 +1244,217 @@ def unsupported_detail_categories(text: str, factors: dict[str, Any]) -> list[st
     expected_timing = str(factors.get("postpartum_timing") or "unknown")
     if has_extra_timing_detail(text, expected_timing):
         categories.append("extra timing detail")
+    descriptor = re.search(
+        r"\b(mild|moderate|severe)\s+(?:depress\w*|anxi\w*|symptoms?|distress)\b",
+        text or "",
+        re.I,
+    )
+    if descriptor:
+        expected_intensity = {"mild": "low", "moderate": "moderate", "severe": "high"}[
+            descriptor.group(1).lower()
+        ]
+        if str(factors.get("symptom_intensity") or "").strip().lower() != expected_intensity:
+            categories.append("conflicting symptom descriptor")
     return categories
+
+
+_META_NARRATIVE_PATTERN = re.compile(
+    r"\b(?:severity|intensity|moderately|low[- ]grade|"
+    r"(?:low|mild|moderate|high|severe) (?:level|degree)(?: of)?|"
+    r"(?:mild|moderate|severe) symptoms?|"
+    r"according to (?:the )?(?:assessment|audit|audited record)|audited record|"
+    r"assigned (?:severity|label)|target (?:severity|label)|classified as|"
+    r"low[- ]intensity|moderate[- ]intensity|high[- ]intensity|"
+    r"at (?:low|moderate|high) intensity|stated symptom|stated support|"
+    r"stated safety|adjustment context|reported symptoms?)\b",
+    re.I,
+)
+_MISSINGNESS_NARRATIVE_PATTERN = re.compile(
+    r"\b(?:current status (?:is )?unknown|details? (?:are|is|were|was) unknown|"
+    r"no clarity|not specified|not provided|none (?:was|were) provided|"
+    r"no specific details?|unknown factors?|the (?:record|account) (?:states|shows|places)|"
+    r"no professional diagnosis or treatment has occurred)\b",
+    re.I,
+)
+
+
+def narrative_quality_violations(
+    item: dict[str, Any], text: str, factors: dict[str, Any]
+) -> list[str]:
+    """Catch human-review failures that schema and grounding checks can miss."""
+    violations: list[str] = []
+    if _META_NARRATIVE_PATTERN.search(text):
+        violations.append("meta or label language")
+    if _MISSINGNESS_NARRATIVE_PATTERN.search(text):
+        violations.append("missingness or record language")
+    if _THIRD_PERSON_NARRATIVE_PATTERN.search(text):
+        violations.append("third-person narration")
+    factor_text = text_values(factors).lower()
+    factor_descriptor_text = re.sub(r"\bpostpartum\s+", "", factor_text)
+    descriptors = re.findall(
+        r"\b(?:mild|moderate|severe)\s+(?:postpartum\s+)?"
+        r"(?:depress\w*|anxi\w*|symptoms?|distress)\b",
+        text or "",
+        re.I,
+    )
+    if any(descriptor.lower() not in factor_descriptor_text for descriptor in descriptors):
+        violations.append("severity descriptor not source-grounded")
+    if re.search(
+        r"(?:^|[.!?]\s+)(?:Acknowledge|Experienced|Prioritizing|Managing|Trying)\b",
+        text,
+        re.I,
+    ):
+        violations.append("sentence fragment or non-diary command")
+
+    slot_values = stage3_sentence_values(item)
+    if slot_values:
+        first_person_slots = sum(
+            bool(re.search(r"\b(?:I|I'm|I've|I'd|my|me)\b", value, re.I))
+            for value in slot_values
+        )
+        if first_person_slots < max(2, len(slot_values) - 1):
+            violations.append("insufficient first-person voice")
+
+    persistence = str(factors.get("symptom_persistence") or "").strip().lower()
+    symptom_terms = r"(?:depress\w*|anxi\w*|symptoms?|thoughts?|feelings?|emotions?|distress)"
+    present_status = re.compile(
+        rf"\b(?:(?:I am|I'm|I have been|I've been|I continue to|I still)\s+"
+        rf"(?:currently\s+)?(?:experiencing|dealing with|struggling with|feeling|having)?"
+        rf"\s*.{{0,25}}?{symptom_terms}|"
+        rf"my {symptom_terms} (?:is|are|remain|affect|impact)|"
+        rf"{symptom_terms} (?:is|are|remain|affect|impact))\b",
+        re.I,
+    )
+    if (persistence.startswith("past,") or persistence in {"resolved", "improved", "recovered"}) \
+            and (
+                present_status.search(text)
+                or re.search(r"\b(?:is|are) (?:causing|holding|affecting|impacting)\b", text, re.I)
+                or re.search(r"\bstill (?:haunt|affect|impact|trouble|bother)\w* me\b", text, re.I)
+            ):
+        violations.append("past or resolved symptoms changed to current")
+    if persistence == "ongoing" and re.search(
+        r"\b(?:previously|past experience|symptoms? (?:had )?resolved|no longer present)\b",
+        text,
+        re.I,
+    ):
+        violations.append("ongoing symptoms changed to past or resolved")
+    if persistence == "ongoing" and not re.search(
+        r"\b(?:ongoing|persist\w*|continue(?:s|d)? to|has continued|have continued|"
+        r"i have been|i've been|all along|still (?:deal\w*|struggl\w*|feel\w*|"
+        r"experienc\w*|work\w*)|remain(?:s|ed)? difficult|has not eased|hasn't eased)\b",
+        text,
+        re.I,
+    ):
+        violations.append("ongoing symptom status omitted")
+    if persistence in {"resolved", "improved", "recovered", "no longer present"} and not re.search(
+        r"\b(?:eased|improved|recovered|resolved|no longer)\b", text, re.I
+    ):
+        violations.append("resolved symptom status omitted")
+    if persistence in {"", "unknown", "not stated", "not specified"}:
+        unsupported_status = re.search(
+            r"\b(?:ongoing|persist\w*|still|currently|lately|every day|daily|previously|"
+            r"resolved|recovered|i have been|i've been|right now)\b|"
+            r"\b(?:i am|i'm) (?:currently )?(?:experienc\w*|feel\w*|dealing|struggl\w*|facing)\b|"
+            r"\bmy (?:feelings?|emotions?) (?:feel|are|remain)\b",
+            text,
+            re.I,
+        )
+        if unsupported_status:
+            violations.append("unsupported symptom status")
+    intensity = str(factors.get("symptom_intensity") or "").strip().lower()
+    if intensity == "high" and not re.search(
+        r"\b(?:intense|severe|extreme|overwhelming|very strong|deep)\b", text, re.I
+    ):
+        violations.append("high symptom intensity omitted")
+
+    coping = str(factors.get("coping_or_adjustment_context") or "").strip().lower()
+    coping_requirements = (
+        (r"needs? time to adjust", r"\bneed(?:ed)?\b.{0,25}\btime\b.{0,25}\badjust\w*\b", "adjustment context omitted"),
+        (r"reduced alcohol", r"\b(?:reduc\w*|limit\w*|cut(?:ting)? back|stopp\w*)\b.{0,35}\b(?:alcohol|drinking)\b|\b(?:alcohol|drinking)\b.{0,35}\b(?:reduc\w*|limit\w*|cut(?:ting)? back|stopp\w*)\b", "alcohol reduction omitted"),
+        (r"exercise.*improv|improv.*exercise", r"\bexercis\w*\b.*\b(?:help\w*|improv\w*|difference)\b|\b(?:help\w*|improv\w*|difference)\b.*\bexercis\w*\b", "exercise improvement omitted"),
+        (r"(?:consistent|resume) exercise", r"\b(?:exercise\w*|gym)\b", "exercise context omitted"),
+        (r"told to wait", r"\b(?:told|advised)\b.{0,25}\bwait\b", "help-seeking outcome omitted"),
+        (r"did not return after feeling dismissed", r"\b(?:therapy|therapist|mental-health professional)\b.{0,55}\b(?:dismiss\w*|did not return|didn't return)\b|\b(?:dismiss\w*|did not return|didn't return)\b.{0,55}\b(?:therapy|therapist|mental-health professional)\b", "therapy outcome omitted"),
+        (r"reached out to a mental-health professional", r"\b(?:mental-health professional|therapist|psychologist|counselor)\b", "professional help omitted"),
+        (r"clinician recognized", r"\bclinician\b.{0,45}\b(?:recogniz\w*|identif\w*|notic\w*)\b|\b(?:recogniz\w*|identif\w*|notic\w*)\b.{0,45}\bclinician\b", "clinical recognition omitted"),
+        (r"hormonal changes", r"\b(?:hormones?|hormonal)\b", "hormonal context omitted"),
+        (r"paused long enough to care", r"\b(?:paused|stopped|eased)\b.{0,45}\bcare\b|\bcare\b.{0,45}\b(?:paused|stopped|eased)\b", "caregiving context omitted"),
+    )
+    for factor_pattern, text_pattern, message in coping_requirements:
+        if re.search(factor_pattern, coping, re.I) and not re.search(text_pattern, text, re.I):
+            violations.append(message)
+
+    bonding = {str(value).strip().lower() for value in factors.get("bonding_indicators", [])}
+    if "positive bonding experience" in bonding and not re.search(
+        r"\b(?:bond\w*|love\w*|connect\w*|close)\b.{0,35}\b(?:baby|infant|child)\b|"
+        r"\b(?:baby|infant|child)\b.{0,35}\b(?:bond\w*|love\w*|connect\w*|close)\b",
+        text,
+        re.I,
+    ):
+        violations.append("positive bonding context omitted")
+    if "positive interaction with baby" in bonding and not re.search(
+        r"\b(?:hold|held|interact\w*|play\w*)\b.{0,25}\b(?:baby|infant|child)\b",
+        text,
+        re.I,
+    ):
+        violations.append("positive infant interaction omitted")
+
+    if item.get("grounding_method") != "deterministic_factor_fallback" and re.search(
+        r"\bi (?:am )?describ(?:e|ing)\b.{0,35}\b(?:same|those)\b|"
+        r"\bthe same emotional (?:difficulty|experience)\b",
+        text,
+        re.I,
+    ):
+        violations.append("formulaic repeated content")
+
+    denials = {str(value).strip().lower() for value in factors.get("risk_denials", [])}
+    if "denied thoughts of self-harm" in denials:
+        if source_has_affirmed_risk(text, _SELF_HARM_PATTERN):
+            violations.append("self-harm denial polarity changed")
+        if not source_has_denied_risk(text, _SELF_HARM_PATTERN):
+            violations.append("self-harm denial omitted")
+    if "denied thoughts of harming my baby" in denials:
+        if source_has_affirmed_risk(text, _INFANT_HARM_PATTERN):
+            violations.append("infant-harm denial polarity changed")
+        if not source_has_denied_risk(text, _INFANT_HARM_PATTERN):
+            violations.append("infant-harm denial omitted")
+    return violations
+
+
+def remove_unsourced_severity_descriptors(
+    item: dict[str, Any], factors: dict[str, Any]
+) -> None:
+    """Remove a bucket-like adjective unless the factor text explicitly contains it."""
+    factor_text = re.sub(r"\bpostpartum\s+", "", text_values(factors).lower())
+    pattern = re.compile(
+        r"\b(?:mild|moderate|severe)\s+(?P<postpartum>postpartum\s+)?"
+        r"(?P<noun>depress\w*|anxi\w*|symptoms?|distress)\b",
+        re.I,
+    )
+    changed = False
+
+    def clean(value: str) -> str:
+        nonlocal changed
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal changed
+            normalized = re.sub(r"\bpostpartum\s+", "", match.group(0).lower())
+            if normalized in factor_text:
+                return match.group(0)
+            changed = True
+            return f"{match.group('postpartum') or ''}{match.group('noun')}"
+
+        return pattern.sub(replace, value)
+
+    slots = item.get("sentences")
+    if isinstance(slots, dict):
+        item["sentences"] = {key: clean(str(value)) for key, value in slots.items()}
+    elif isinstance(slots, list):
+        item["sentences"] = [clean(str(value)) for value in slots]
+    elif isinstance(item.get("synthetic_text"), str):
+        item["synthetic_text"] = clean(str(item["synthetic_text"]))
+    if changed:
+        item["severity_descriptor_removed"] = True
 
 
 def disallowed_content_categories(factors: dict[str, Any]) -> list[str]:
@@ -1038,7 +1571,15 @@ def model_digest(host: str, model: str, timeout: int = 30) -> str | None:
         )
         with urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
-        return data.get("digest") or data.get("details", {}).get("digest")
+        digest = data.get("digest") or data.get("details", {}).get("digest")
+        if digest:
+            return str(digest)
+        with urlopen(f"{host.rstrip('/')}/api/tags", timeout=timeout) as response:
+            tags = json.loads(response.read().decode("utf-8"))
+        for entry in tags.get("models", []):
+            if entry.get("name") == model or entry.get("model") == model:
+                return str(entry.get("digest") or "") or None
+        return None
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         return None
 
@@ -1068,10 +1609,11 @@ SEVERITY_DEFS = """EPDS-aligned narrative severity buckets (use one exact value)
 - "Minimal": transient adjustment stress, mild fatigue, or situational worry with
   little or no functional impairment. Never use Minimal for high-intensity or
   persistent/ongoing symptoms.
-- "Mild": noticeable mood disturbance, guilt, anxiety, or intermittent distress
-  with limited impairment and preserved basic functioning.
-- "Moderate": persistent moderate/high mood symptoms, rumination, meaningful functional impairment,
-  or bonding-difficulty indicators, without pervasive major impairment.
+- "Mild": noticeable low/moderate mood disturbance, guilt, anxiety, or intermittent
+  distress with limited impairment and preserved basic functioning.
+- "Moderate": explicitly high-intensity symptoms, persistent moderate/high mood
+  symptoms, rumination, meaningful functional impairment, or bonding difficulty,
+  without pervasive major impairment.
 - "Severe": pervasive hopelessness, sustained major impairment, intense anxiety,
   significant bonding disruption, or urgent distress cues. A word such as "severe"
   or "depression" alone is insufficient without high intensity plus major impact,
@@ -1081,9 +1623,9 @@ Timing is context, not a rule. These are narrative buckets, not reconstructed EP
 
 SEVERITY_BOUNDARY_RULES = """Boundary rules:
 - Minimal: symptoms must be low/transient/resolved and functioning essentially intact.
-- Mild: noticeable symptoms but no more than limited functional impact.
-- Moderate: persistent moderate/high symptoms or explicit meaningful, non-major functional difficulty.
-  High intensity alone, without supported duration or impact, does not establish Moderate.
+- Mild: noticeable low/moderate symptoms but no more than limited functional impact.
+- Moderate: explicitly high intensity, persistent moderate/high symptoms, or explicit
+  meaningful, non-major functional difficulty.
 - Severe: pervasive high-intensity distress plus major impairment, serious bonding
   disruption, inability to manage basic care, hopelessness, or urgent safety cues.
 - Use the highest bucket directly supported by the factors, but do not infer missing
@@ -1107,7 +1649,7 @@ For every input item, return one object with the same integer "id" and these fie
  "symptom_persistence": "...", "functional_impact": ["..."],
  "sleep_context": "...", "feeding_or_infant_care_stressors": ["..."],
  "perceived_support": "...", "bonding_indicators": ["..."],
- "risk_indicators": ["..."],
+ "risk_indicators": ["..."], "risk_denials": ["..."],
  "coping_or_adjustment_context": "..."}}
 
 Extraction completeness. Inventing detail is still forbidden, but do not leave a field
@@ -1115,6 +1657,8 @@ empty when the source supports it. Work through the source and record everything
 actually states:
 - List every distinct symptom, mood state, or emotional experience separately. Do not
   collapse several into one generic label.
+- Assign high intensity only from explicit strong wording, urgent risk, or major stated
+  impairment. A duration or the word depression alone does not establish high intensity.
 - Treat self-directed beliefs as symptoms when stated, for example guilt, feeling like
   a bad parent, worthlessness, or believing the family would be better off without them.
 - Record the content of intrusive or negative thoughts, not just the fact that they occurred.
@@ -1122,6 +1666,8 @@ actually states:
 - Record any stated sleep, rest, or exhaustion detail in sleep_context.
 - Record stated feeding, milk supply, or infant-care difficulties.
 - Record stated help, isolation, partner or family involvement in perceived_support.
+- Put affirmed self-harm or infant-harm thoughts only in risk_indicators. Put an
+  explicit denial only in risk_denials; never reverse its polarity.
 - Record stated treatment, exercise, medication, or self-management in
   coping_or_adjustment_context.
 Leave a field empty only when the source genuinely says nothing about it. An empty field
@@ -1191,7 +1737,8 @@ For each input, return one object with this exact nested structure:
   "symptom_persistence": "...", "functional_impact": ["..."],
   "sleep_context": "...", "feeding_or_infant_care_stressors": ["..."],
   "perceived_support": "...", "bonding_indicators": ["..."],
-  "risk_indicators": ["..."], "coping_or_adjustment_context": "..."}},
+  "risk_indicators": ["..."], "risk_denials": ["..."],
+  "coping_or_adjustment_context": "..."}},
  "classification": {{"severity": "Minimal|Mild|Moderate|Severe",
   "rationale": "one grounded sentence"}},
  "narrative": {{"sentences": {{{sentence_schema}}},
@@ -1205,10 +1752,15 @@ Requirements:
   relationship, treatment, event, cause, or duration.
 - Do not copy or closely paraphrase the source and do not retain identifiers.
 - The classification must satisfy the stated severity boundary rules.
+- Treat risk_denials only as explicit denials, never as urgent-risk evidence.
 - Explicitly compute which labels conflict with the extracted factors before choosing.
   Persistent moderate/high symptoms require at least Moderate. Severe requires high
   intensity plus supported impact, bonding disruption, hopelessness, or urgent risk.
 - The narrative must use only its factors and match its classification.
+- Preserve symptom and risk tense exactly. Past or unresolved historical factors
+  must not become current. Preserve every explicit risk denial as a denial.
+- Never expose labels or pipeline metadata in prose: do not say severity, target,
+  classification, assessment, audit, record, or named low/moderate/high intensity.
 - For known timing, use exactly the compatible broad phrase: within the first two weeks
   after birth; between two and six weeks after birth; between six and twelve weeks after
   birth; or more than three months after birth. For unknown timing, include no time cue.
@@ -1229,6 +1781,7 @@ generalized factors below; you will not see raw source text.
 {SEVERITY_DEFS}
 {SEVERITY_BOUNDARY_RULES}
 {timing_note}
+An entry in risk_denials is evidence that the risk was denied, not an urgent-risk cue.
 For each input, return the same integer "id", one exact severity label, and a
 one-sentence rationale grounded in the factors:
 {{"id": 0, "severity": "Minimal|Mild|Moderate|Severe", "rationale": "..."}}
@@ -1250,10 +1803,6 @@ def prompt_stage3(
     regeneration_attempt: int = 0,
     correction_attempt: int = 0,
 ) -> str:
-    sentence_schema = ", ".join(
-        f'"s{index:02d}": "7-15 words"'
-        for index in range(1, STAGE3_SENTENCE_COUNT + 1)
-    )
     timing = TIMING_DEFS + "\n" if use_timing else ""
     timing_instruction = (
         'Copy "postpartum_timing" exactly into "timing" and make the narrative '
@@ -1271,48 +1820,57 @@ def prompt_stage3(
     if regeneration_attempt:
         regeneration = (
             f"This is regeneration attempt {regeneration_attempt}. Produce a materially "
-            "different composition while preserving only the supplied factors and target. "
-            "Each input may contain validator_feedback. Correct the stated severity/timing "
-            "mismatch directly: reduce or strengthen severity cues toward intended_severity "
-            "and use the required timing rule for intended_timing.\n"
+            "different composition while preserving only the supplied facts. Each input may "
+            "contain validator_feedback. Follow target_expression_rule and correct the stated "
+            "strength or timing mismatch without naming a label.\n"
         )
     correction = ""
     if correction_attempt:
         correction = (
-            "A prior response failed strict validation, commonly because it was too short. "
-            f"Fill all {STAGE3_SENTENCE_COUNT} required sentence slots this time. "
-            "Each slot must contain 5-15 words. "
-            "Do not omit slots or return a short summary.\n"
+            "A prior response failed strict validation. Return the requested sentence count, "
+            "word range, metadata, tense, and factual content exactly this time.\n"
         )
-    return f"""Generate original first-person postpartum diary narratives for
-research. Stage 3 receives generalized factors only, never source posts.
+    return f"""Rewrite grounded content plans as natural first-person postpartum diary
+narratives for research. Stage 3 receives generalized factors only, never source posts.
 
-{SEVERITY_DEFS}
-{SEVERITY_BOUNDARY_RULES}
 {timing}
 {timing_instruction}{regeneration}{correction}
 Constraints:
 - Each input contains required_min_words and required_max_words. Its assembled
   narrative must stay inside that exact range. The overall configured ceiling is
   {min_words}-{max_words} words for richer inputs.
-- Fill exactly {STAGE3_SENTENCE_COUNT} ordered sentence slots, each containing
-  5-15 words. Short, evidence-sparse inputs should use concise slots.
-- Ground every sentence in at least one supplied factor. With sparse factors,
-  reflect on the same supported experience without adding symptoms, impairment,
-  relationships, actions, causes, or duration.
+- grounded_scaffold is the safe base. Rewrite it lightly for fluency. You may add a
+  concrete detail only when it appears explicitly in deidentified_summary or another
+  non-empty factor. Never add information merely to sound realistic.
+- Return "sentences" as a JSON list containing exactly required_sentence_count complete
+  sentences. Two to four sentences are allowed. End every string with punctuation and
+  begin at least two with "I" or "My".
+- Every sentence must express only a fact in grounded_scaffold or another supplied
+  non-empty factor. Prefer an unused fact from deidentified_summary over repeating a
+  fact. A sparse input may revisit one supported experience without repeating wording.
+- Do not use filler such as "I am describing those same emotions," "the same emotional
+  difficulty," or repeated uses of "part of my postpartum experience."
+- Preserve symptom intensity, temporal status, functional impact, risk polarity, and
+  coping/support facts from the scaffold. Do not soften or strengthen them.
+- Copy a canonical timing sentence or explicit risk-denial sentence exactly when one is
+  present in grounded_scaffold. Do not add another timing or risk statement.
 - Write as the person, in the first person, using "I" and "my". Never write about her
   from the outside. Do not use "the individual", "the mother", "she", or "they".
-- deidentified_summary is your main material. It usually carries the most concrete
-  supported content, so build the entry from it rather than from the field labels.
 - Never narrate the data itself. An empty field means stay silent about that topic, not
   describe it as missing. Do not write that something is unknown or unspecified, and do
   not mention severity, intensity or persistence as named quantities.
-- Match the supplied severity in expressed intensity, persistence, and impairment.
-- Minimal must show transient/low distress; Mild must show noticeable distress
-  without adding persistence or impairment; Moderate must show persistent meaningful
-  distress and include impairment only when supplied. Severe must use only supplied
-  major-impairment, bonding-disruption, or urgent-risk factors.
-- Do not copy or closely paraphrase an input field.
+- Never expose a label or pipeline concept in prose. Do not use phrases such as
+  "severity remains Mild", "classified as", "according to the assessment", "audited
+  record", "high-intensity", "stated support", or "adjustment context".
+- Follow required_status_rule exactly. Ongoing factors use present tense. Historical
+  factors use past tense and must not imply current symptoms or risk. Resolved factors
+  remain resolved. Unknown persistence must not become ongoing, past, or resolved.
+- Preserve risk_denials explicitly and only as denials. Never convert a denied thought
+  into an affirmed safety concern.
+- Follow target_expression_rule for clinical strength, but never quote that rule or
+  describe a label, level, assessment, intensity, or severity in the narrative.
+- Paraphrase the grounded scaffold enough to be natural, except for locked timing and
+  risk-denial sentences. Never copy or closely paraphrase the unavailable source post.
 - Use only the supplied factors. Do not invent a partner, infant sex, occupation,
   feeding method, medical event, treatment, or support person unless supplied.
 - Each input contains disallowed_content_categories. Do not mention or imply any
@@ -1321,11 +1879,9 @@ Constraints:
 - Keep the narrative introspective. Do not invent phone calls, visits, appointments,
   conversations, or other concrete events merely to add length.
 - Do not add names, handles, contact details, exact dates, locations, or institutions.
-- Copy the supplied severity exactly into "target".
 
 For each input, return:
-{{"id": 0, "sentences": {{{sentence_schema}}},
- "target": "exact input severity"{timing_field},
+{{"id": 0, "sentences": ["sentence 1", "sentence 2"]{timing_field},
  "style": "first-person postpartum diary"}}
 
 Return a JSON list with exactly one output per input ID. {JSON_ONLY}
@@ -1338,14 +1894,13 @@ def prompt_stage3_length_repair(
 ) -> str:
     target_low = min_words
     target_high = min(max_words, max(target_low, 60))
+    factor_block = item.get("factors") if isinstance(item.get("factors"), dict) else {}
+    sentence_count = min(4, max(2, int(factor_block.get("required_sentence_count", 3))))
     sentence_low = max(
-        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + sentence_count - 1) // sentence_count
     )
-    sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
-    sentence_schema = ", ".join(
-        f'"s{index:02d}": "{sentence_low}-{sentence_high} words"'
-        for index in range(1, STAGE3_SENTENCE_COUNT + 1)
-    )
+    sentence_high = max(sentence_low, target_high // sentence_count)
+    sentence_schema = ", ".join(f'"sentence {index}"' for index in range(1, sentence_count + 1))
     item_id = int(item["id"])
     target = str(item["target"])
     expected_timing = str(item.get("expected_timing", "unknown"))
@@ -1377,14 +1932,23 @@ def prompt_stage3_length_repair(
 The draft and factors are synthetic/generalized; no raw source post is provided.
 
 Requirements:
-- Fill exactly {STAGE3_SENTENCE_COUNT} ordered fields in the "sentences" object.
+- Return exactly {sentence_count} ordered strings in the "sentences" list.
 - Each field must be a complete sentence containing {sentence_low}-{sentence_high}
   words, for {target_low}-{target_high} words total.
 - Do not omit fields or return a short summary.
+- Treat grounded_scaffold inside factors as the complete content plan. Rewrite it
+  lightly, without adding or omitting clinical facts. Begin at least two sentences
+  with "I" or "My".
+- End every sentence string with punctuation. Use each supported fact before repeating
+  one, and do not use "I am describing" or "the same emotional difficulty" as filler.
 - Preserve the supplied target and expected timing exactly.
 - For severity: {severity_requirement}.
 - For timing: {timing_requirement}.
 - Preserve supported meaning, but rewrite and expand the composition.
+- Follow required_status_rule exactly. Do not change historical, ongoing, resolved,
+  or unknown symptom status, and preserve explicit risk denials as denials.
+- Do not mention labels, severity, intensity levels, assessments, audits, records,
+  missing fields, or unknown data in the narrative.
 - Ground every sentence in a supplied factor. Revisit supported internal experience
   when facts are sparse instead of adding symptoms, impairment, relationships, or events.
 - Use only supplied factors. Do not invent a partner, infant sex, occupation,
@@ -1393,7 +1957,7 @@ Requirements:
 - Do not add names, handles, contact details, exact dates, locations, or institutions.
 
 Return one JSON object:
-{{"id": {item_id}, "sentences": {{{sentence_schema}}},
+{{"id": {item_id}, "sentences": [{sentence_schema}],
  "target": {json.dumps(target)}{timing_field},
  "style": "first-person postpartum diary"}}
 
@@ -1408,14 +1972,13 @@ def prompt_stage3_content_repair(
 ) -> str:
     target_low = min_words
     target_high = min(max_words, max(target_low, 60))
+    factor_block = item.get("factors") if isinstance(item.get("factors"), dict) else {}
+    sentence_count = min(4, max(2, int(factor_block.get("required_sentence_count", 3))))
     sentence_low = max(
-        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + sentence_count - 1) // sentence_count
     )
-    sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
-    sentence_schema = ", ".join(
-        f'"s{index:02d}": "{sentence_low}-{sentence_high} words"'
-        for index in range(1, STAGE3_SENTENCE_COUNT + 1)
-    )
+    sentence_high = max(sentence_low, target_high // sentence_count)
+    sentence_schema = ", ".join(f'"sentence {index}"' for index in range(1, sentence_count + 1))
     target = str(item["target"])
     expected_timing = str(item.get("expected_timing", "unknown"))
     item_id = int(item["id"])
@@ -1427,6 +1990,7 @@ def prompt_stage3_content_repair(
         ),
         "infant sex": "Use only neutral terms such as baby, infant, or child; do not state infant sex.",
         "feeding method": "Remove feeding-method details unless the factors explicitly contain them.",
+        "infant-care detail": "Remove infant-care responsibilities unless explicit in the factors.",
         "treatment/medical event": (
             "Remove medication, therapy, clinician, diagnosis, or medical-event details unless explicit in factors."
         ),
@@ -1453,6 +2017,20 @@ def prompt_stage3_content_repair(
         "overwhelm detail": "Remove feeling overwhelmed unless explicit in the factors.",
         "loss of interest": "Remove loss-of-interest claims unless explicit in the factors.",
         "physical discomfort": "Remove specific pain or physical symptoms unless explicit in the factors.",
+        "frequency or trajectory detail": (
+            "Remove frequency, improvement, worsening, or day-to-day claims unless explicit in the factors."
+        ),
+        "coping or priority detail": "Remove coping actions or priorities unless explicit in the factors.",
+        "causal or benefit detail": "Remove causal or benefit claims unless explicit in the factors.",
+        "new emotional appraisal": (
+            "Remove hope, gratitude, confidence, pride, relief, or optimism unless explicit in the factors."
+        ),
+        "expectation or comparison detail": (
+            "Remove comparisons with prior expectations unless explicit in the factors."
+        ),
+        "conflicting symptom descriptor": (
+            "Use ordinary emotional wording that matches the supplied symptom intensity."
+        ),
         "extra timing detail": (
             "Keep only the required bucket timing phrase. Remove every other duration or numeric time cue."
         ),
@@ -1468,18 +2046,68 @@ Required corrections:
 {rules}
 
 Additional requirements:
-- Fill exactly {STAGE3_SENTENCE_COUNT} ordered fields in the "sentences" object.
+- Return exactly {sentence_count} ordered strings in the "sentences" list.
 - Each field must be a complete sentence containing {sentence_low}-{sentence_high}
   words, producing {target_low}-{target_high} words total.
 - Do not omit fields or return a short summary.
+- Use grounded_scaffold inside factors as the complete content plan. Begin at least two
+  sentences with "I" or "My" and add no fact absent from that scaffold.
+- End every sentence string with punctuation and avoid repetitive summary filler.
 - Preserve target {json.dumps(target)} and timing {json.dumps(expected_timing)} exactly.
 - Preserve supported symptom intensity, persistence, impairment, and timing.
+- Follow required_status_rule exactly and preserve every explicit risk denial as a denial.
+- Remove label, assessment, audit, record, field-name, and missing-data language.
 - Ground every sentence in a supplied factor; do not replace removed facts with new ones.
 - Keep the narrative first-person and natural, but prefer introspection over invented events.
 - Do not add identifiers, exact dates, locations, institutions, or source-like wording.
 
 Return one JSON object:
-{{"id": {item_id}, "sentences": {{{sentence_schema}}},
+{{"id": {item_id}, "sentences": [{sentence_schema}],
+ "target": {json.dumps(target)}{timing_field},
+ "style": "first-person postpartum diary"}}
+
+{JSON_ONLY}
+INPUT:
+{json.dumps(item, ensure_ascii=False)}"""
+
+
+def prompt_stage3_validation_repair(
+    item: dict[str, Any], min_words: int, max_words: int, use_timing: bool
+) -> str:
+    """Give a rejected draft one focused chance to satisfy local checks."""
+    target_low = min_words
+    target_high = min(max_words, max(target_low, 60))
+    factor_block = item.get("factors") if isinstance(item.get("factors"), dict) else {}
+    sentence_count = min(4, max(2, int(factor_block.get("required_sentence_count", 3))))
+    sentence_low = max(
+        6, (target_low + sentence_count - 1) // sentence_count
+    )
+    sentence_high = max(sentence_low, target_high // sentence_count)
+    sentence_schema = ", ".join(f'"sentence {index}"' for index in range(1, sentence_count + 1))
+    item_id = int(item["id"])
+    target = str(item["target"])
+    expected_timing = str(item.get("expected_timing", "unknown"))
+    timing_field = f', "timing": {json.dumps(expected_timing)}' if use_timing else ""
+    return f"""Repair one rejected synthetic postpartum narrative.
+The validation errors identify what must change. Do not repeat those messages in prose.
+
+Requirements:
+- Return exactly {sentence_count} ordered strings in the "sentences" list, each containing
+  {sentence_low}-{sentence_high} words, for {target_low}-{target_high} words total.
+- Treat grounded_scaffold inside factors as the complete content plan. Rewrite only
+  that plan, and begin at least two sentences with "I" or "My".
+- End every sentence string with punctuation. Use distinct supported facts before
+  revisiting one, and avoid formulaic phrases about "describing" the experience.
+- Use only the supplied factors. Every sentence must restate a supported symptom,
+  status, timing, impact, care issue, bond, risk statement, support, or coping detail.
+- Follow required_status_rule exactly and preserve risk denials only as denials.
+- Remove unsupported details rather than replacing them with plausible new details.
+- Preserve target {json.dumps(target)} and timing {json.dumps(expected_timing)} exactly.
+- Do not mention labels, field names, validation, missing information, or records.
+- Keep the writing natural, first-person, and free of identifiers or precise new timing.
+
+Return one JSON object:
+{{"id": {item_id}, "sentences": [{sentence_schema}],
  "target": {json.dumps(target)}{timing_field},
  "style": "first-person postpartum diary"}}
 
@@ -1497,13 +2125,9 @@ together with every structured field. The summary is a supplied fact with exactl
 same standing as the lists. A claim drawn from the summary is supported.
 
 The narrative is SUPPOSED to reword the facts. It is written in the first person and it
-will not match the field wording. Do not treat rewording as an addition. The following
-are all supported and must NOT be flagged:
-- a paraphrase or first-person version of the summary or any field
-- a plainer or more natural phrasing of the same fact
-- combining two supplied facts in one sentence
-- restating a supplied intensity, persistence or timing value in ordinary words
-- reflective phrasing that carries no new fact, such as "this has been hard for me"
+will not match the field wording. Do not treat a faithful paraphrase, a plainer phrasing,
+a combination of supplied facts, or ordinary wording of supplied intensity, persistence,
+or timing as an addition.
 
 Flag a claim ONLY when it introduces information that is genuinely absent from the whole
 factors object: a new symptom, a new functional effect, a claim that something is absent
@@ -1511,18 +2135,14 @@ or fine, a relationship or other person, a social action, a coping action, a cau
 physical condition, a concrete event, or a duration more precise than the supplied timing.
 The severity target alone never licenses an extra symptom or impairment. A timing bucket
 supports only its required broad timing phrase.
-
-Worked examples. Suppose the summary says the person is experiencing depression they did
-not initially recognize, and that their emotional state changed since giving birth, with
-persistence "ongoing" and coping "needs time to adjust".
-- "My emotional state has changed significantly since giving birth." SUPPORTED, it
-  restates the summary.
-- "I did not realise at first that I was depressed." SUPPORTED, it paraphrases the summary.
-- "The depression is still with me." SUPPORTED, it restates persistence.
-- "I am giving myself time to adjust." SUPPORTED, it restates coping.
-- "My husband helps me in the evenings." NOT SUPPORTED, no partner in the factors.
-- "I have barely slept in weeks." NOT SUPPORTED, no sleep information in the factors.
-- "I cannot manage to feed the baby." NOT SUPPORTED, no functional impact supplied.
+General wording that locates an experience after childbirth is already supported when
+the factors explicitly describe a postpartum experience; it is not a new medical event.
+A retrospective phrase does not claim that symptoms resolved or remain current unless
+the narrative separately says so.
+Also flag any change in temporal status or polarity. Historical symptoms or safety
+concerns cannot become current; unknown persistence cannot become ongoing or resolved;
+and an explicit risk denial cannot become an affirmed thought. Label, audit, assessment,
+record, field-name, and missing-data language is never acceptable diary prose.
 
 EMPTY FIELDS ARE SILENCE, NOT PERMISSION. An empty list or empty string means the source
 said nothing on that topic, so any claim about that topic is unsupported unless the
@@ -1533,6 +2153,7 @@ summary states it. Apply this directly:
 - feeding_or_infant_care_stressors empty: any feeding or infant-care difficulty is unsupported
 - bonding_indicators empty: any claim about closeness or distance from the baby is unsupported
 - risk_indicators empty: any mention of self-harm or harm to the baby is unsupported
+- risk_denials non-empty: preserve the denial; any affirmed version is unsupported
 This holds no matter how plausible the claim is for someone with the supplied symptoms.
 
 Before flagging a claim, search the whole factors object, including the summary, for
@@ -1543,8 +2164,9 @@ Return one object per input ID:
 {{"id": 0, "grounded": true, "unsupported_claims": [],
  "reason": "brief sentence-level assessment"}}
 
-unsupported_claims must contain ONLY claims you are actually rejecting. Never list a
-claim there that you judged supported. If a claim is supported, leave it out entirely.
+unsupported_claims must contain ONLY exact verbatim sentences or minimal exact phrases
+copied from the supplied narrative. Never paraphrase a claim and never quote an example
+or wording from these instructions. If a claim is supported, leave it out entirely.
 Set grounded to false if and only if unsupported_claims is non-empty. For each entry,
 name the new information it introduces in "reason". Return a JSON list with one object
 per input ID. {JSON_ONLY}
@@ -1557,14 +2179,13 @@ def prompt_stage3_semantic_repair(
 ) -> str:
     target_low = min_words
     target_high = min(max_words, max(target_low, 60))
+    factor_block = item.get("factors") if isinstance(item.get("factors"), dict) else {}
+    sentence_count = min(4, max(2, int(factor_block.get("required_sentence_count", 3))))
     sentence_low = max(
-        5, (target_low + STAGE3_SENTENCE_COUNT - 1) // STAGE3_SENTENCE_COUNT
+        5, (target_low + sentence_count - 1) // sentence_count
     )
-    sentence_high = max(sentence_low, target_high // STAGE3_SENTENCE_COUNT)
-    sentence_schema = ", ".join(
-        f'"s{index:02d}": "{sentence_low}-{sentence_high} words"'
-        for index in range(1, STAGE3_SENTENCE_COUNT + 1)
-    )
+    sentence_high = max(sentence_low, target_high // sentence_count)
+    sentence_schema = ", ".join(f'"sentence {index}"' for index in range(1, sentence_count + 1))
     item_id = int(item["id"])
     target = str(item["target"])
     expected_timing = str(item.get("expected_timing", "unknown"))
@@ -1574,17 +2195,22 @@ The factors are the entire factual boundary. Remove every unsupported claim list
 the auditor. Do not replace it with another fact.
 
 Requirements:
-- Fill exactly {STAGE3_SENTENCE_COUNT} ordered sentence fields, each with
+- Return exactly {sentence_count} ordered strings in the "sentences" list, each with
   {sentence_low}-{sentence_high} words, for {target_low}-{target_high} words total.
+- grounded_scaffold inside factors is the complete replacement content plan. Rewrite
+  only that plan and begin at least two sentences with "I" or "My".
+- End every sentence string with punctuation and avoid formulaic repeated content.
 - Every sentence must be directly supported by at least one supplied factor.
 - When factors are sparse, revisit the supported internal experience in plain language.
 - Do not add symptoms, impairment, normal functioning, relationships, actions, causes,
   physical conditions, events, or duration.
+- Preserve required_status_rule exactly, including the tense and polarity of any risk
+  statement. Never expose severity labels, assessments, audits, or field names in prose.
 - Preserve the target and required broad timing phrase exactly.
 - Keep only the required timing phrase; add no second time or duration cue.
 
 Return one JSON object:
-{{"id": {item_id}, "sentences": {{{sentence_schema}}},
+{{"id": {item_id}, "sentences": [{sentence_schema}],
  "target": {json.dumps(target)}{timing_field},
  "style": "first-person postpartum diary"}}
 
@@ -1600,7 +2226,7 @@ def prompt_stage4(narrative: str, use_timing: bool) -> str:
         "For timing, prioritize explicit relative phrases: first two weeks = very early; "
         "two-to-six weeks = early; six-to-twelve weeks = intermediate; more than three "
         "months = later. Return unknown when none is stated; do not assume early merely "
-        "because the writer has an infant.\n"
+        "because the writer has an infant or says only after giving birth/postpartum.\n"
         if use_timing
         else ""
     )
@@ -1612,7 +2238,9 @@ own. You are intentionally not shown the intended severity or timing.
 {timing}
 Choose Severe rather than Moderate when pervasive distress is paired with major
 impairment, inability to manage basic care, serious bonding disruption, or urgent
-risk. Choose Minimal only for transient/low distress with intact functioning.
+risk. Choose Minimal only for transient/low distress with intact functioning. For a
+historical or resolved account, rate the described postpartum episode rather than the
+writer's current state.
 {timing_decision}
 Return one object:
 {{"predicted_severity": "Minimal|Mild|Moderate|Severe"{timing_field},
@@ -1639,9 +2267,10 @@ def validate_stage1(
     summary = item.get("deidentified_summary")
     if not isinstance(summary, str) or not summary.strip():
         return False, "missing deidentified_summary"
+    item.setdefault("risk_denials", [])
     for key in (
         "symptoms", "functional_impact", "feeding_or_infant_care_stressors",
-        "bonding_indicators", "risk_indicators",
+        "bonding_indicators", "risk_indicators", "risk_denials",
     ):
         if not isinstance(item.get(key), list):
             return False, f"{key} must be a list"
@@ -1657,25 +2286,108 @@ def validate_stage1(
     generalize_precise_ages(item)
     item["symptom_persistence"] = source_persistence(source_text)
     source_lower = (source_text or "").lower()
-    self_harm_pattern = re.compile(
-        r"\b(?:take my life|end my life|kill myself|suicid\w*|self[- ]?harm|"
-        r"want(?:ed)? to die)\b",
-        re.I,
-    )
-    infant_harm_pattern = re.compile(
-        r"\b(?:take|end) (?:my )?(?:baby|infant|child)(?:'s)? life\b|"
-        r"\bharm(?:ing)? (?:my |the )?(?:baby|infant|child)\b|"
-        r"\b(?:take|end|contemplat\w*).{0,80}\b(?:baby|infant|child)(?:'s)? life\b",
-        re.I,
-    )
+    if item["symptom_persistence"].startswith("past,") or item["symptom_persistence"] == "resolved":
+        cleaned_summary = str(item.get("deidentified_summary") or "")
+        cleaned_summary = re.sub(r"\bis currently experiencing\b", "experienced", cleaned_summary, flags=re.I)
+        cleaned_summary = re.sub(r"\bis experiencing\b", "experienced", cleaned_summary, flags=re.I)
+        cleaned_summary = re.sub(r"\bis suffering from\b", "experienced", cleaned_summary, flags=re.I)
+        cleaned_summary = re.sub(r"\bcurrently\b\s*", "", cleaned_summary, flags=re.I)
+        item["deidentified_summary"] = re.sub(r"\s+", " ", cleaned_summary).strip()
+    if not re.search(
+        r"\b(?:function\w*|daily (?:life|activities|tasks)|work\w*|job|care(?:giving)?|"
+        r"look after|handle|manage|unable|cannot|can't|hard to|tough (?:for me )?to|"
+        r"get out of bed|chores?|responsibilit\w*)\b",
+        source_lower,
+    ):
+        item["functional_impact"] = []
+    if not re.search(
+        r"\b(?:feed\w*|breast ?milk|milk supply|nurs\w*|formula|bottle|baby duty|"
+        r"care for (?:my |the )?(?:baby|infant|child))\b",
+        source_lower,
+    ):
+        item["feeding_or_infant_care_stressors"] = []
+    if not re.search(r"\b(?:sleep\w*|awake|insomnia|rest\w*|tired\w*|exhaust\w*)\b", source_lower):
+        item["sleep_context"] = ""
+    # Trust only source patterns below, never a free-form model coping inference.
+    item["coping_or_adjustment_context"] = ""
     # Risk fields must come from affirmative source wording, not model inference.
     item["risk_indicators"] = []
-    if source_has_affirmed_risk(source_lower, self_harm_pattern):
+    item["risk_denials"] = []
+    if source_has_affirmed_risk(source_lower, _SELF_HARM_PATTERN):
         item["risk_indicators"].append("thoughts of self-harm")
-    if source_has_affirmed_risk(source_lower, infant_harm_pattern):
+    if source_has_affirmed_risk(source_lower, _INFANT_HARM_PATTERN):
         item["risk_indicators"].append("thoughts of harming my baby")
-    if re.search(r"\breached out to (?:a )?(?:psychologist|therapist|counselor)\b", source_lower):
+    if source_has_denied_risk(source_lower, _SELF_HARM_PATTERN):
+        item["risk_denials"].append("denied thoughts of self-harm")
+    if source_has_denied_risk(source_lower, _INFANT_HARM_PATTERN):
+        item["risk_denials"].append("denied thoughts of harming my baby")
+    item["symptom_intensity"] = source_supported_intensity(
+        source_text, item["risk_indicators"]
+    )
+    item["symptoms"] = [
+        re.sub(
+            r"^\s*(?:mild|moderate|severe|intense)\s+(?=(?:postpartum\s+)?"
+            r"(?:depress\w*|anxi\w*|symptoms?|distress)\b)",
+            "",
+            str(value),
+            flags=re.I,
+        ).strip()
+        for value in item["symptoms"]
+    ]
+    if re.search(r"\b(?:i|we) (?:just )?need(?:ed)? (?:some )?time\b", source_lower):
+        item["coping_or_adjustment_context"] = "needs time to adjust"
+    elif re.search(
+        r"\b(?:tried to seek|sought) help\b.{0,80}\b(?:told|advised)\b.{0,35}\bwait\b",
+        source_lower,
+    ):
+        item["coping_or_adjustment_context"] = "sought help but was told to wait"
+    elif re.search(
+        r"\b(?:saw|visited) (?:a )?(?:therapist|psychologist|counselor)\b", source_lower
+    ) and re.search(r"\b(?:did not|didn'?t) (?:make|schedule|attend|return)\b", source_lower):
+        item["coping_or_adjustment_context"] = (
+            "sought therapy but did not return after feeling dismissed"
+        )
+    elif re.search(r"\breached out to (?:a )?(?:psychologist|therapist|counselor)\b", source_lower):
         item["coping_or_adjustment_context"] = "reached out to a mental-health professional"
+    elif re.search(
+        r"\b(?:pediatrician|clinician|doctor)\b.{0,45}\b"
+        r"(?:caught|identified|recognized|noticed)\b.{0,25}\bdepress\w*",
+        source_lower,
+    ):
+        item["coping_or_adjustment_context"] = (
+            "a clinician recognized the depression during an infant checkup"
+        )
+    elif re.search(r"\bexercis\w*(?:\s+more)?\s+consistently\b", source_lower):
+        if re.search(r"\b(?:help\w*|improv\w*|difference)\b", source_lower):
+            item["coping_or_adjustment_context"] = (
+                "used consistent exercise and noticed some improvement"
+            )
+        else:
+            item["coping_or_adjustment_context"] = "used consistent exercise as part of coping"
+    elif re.search(r"\b(?:get|getting) back (?:in|to) the gym\b", source_lower):
+        item["coping_or_adjustment_context"] = "wanted to resume exercise"
+    elif re.search(
+        r"\b(?:hormones?|hormonal)\b.{0,80}\bdepress\w*|"
+        r"\bdepress\w*\b.{0,80}\b(?:hormones?|hormonal)\b",
+        source_lower,
+    ):
+        item["coping_or_adjustment_context"] = (
+            "associated the depression with hormonal changes"
+        )
+    elif re.search(
+        r"\b(?:cut(?:ting)? back on|reduc(?:e|ed|ing)|stopp(?:ed|ing)|limit(?:ed|ing)?)\b.{0,30}"
+        r"\b(?:alcohol|drink(?:ing)?)\b",
+        source_lower,
+    ):
+        item["coping_or_adjustment_context"] = "reduced alcohol consumption"
+    elif re.search(
+        r"\beverything stopped long enough\b.{0,45}\bcare (?:for|of) (?:her|him|them|"
+        r"my (?:baby|infant|child))\b",
+        source_lower,
+    ):
+        item["coping_or_adjustment_context"] = (
+            "symptoms paused long enough to care for the baby"
+        )
     negative_bond = re.search(
         r"\b(?:difficulty bonding|cannot bond|can't bond|detached|disconnected|no bond)\b",
         source_lower,
@@ -1684,10 +2396,17 @@ def validate_stage1(
         r"\b(?:bond\w*|connect\w*|attach\w*|love\w*)\b.{0,30}\b(?:baby|infant|child)\b",
         source_lower,
     )
+    positive_interaction = re.search(
+        r"\b(?:able to|could)\s+(?:hold|interact with|play with)\s+my\s+"
+        r"(?:baby|infant|child)\b",
+        source_lower,
+    )
     if negative_bond:
         item["bonding_indicators"] = ["difficulty bonding"]
     elif positive_bond:
         item["bonding_indicators"] = ["positive bonding experience"]
+    elif positive_interaction:
+        item["bonding_indicators"] = ["positive interaction with baby"]
     else:
         item["bonding_indicators"] = []
     if re.search(r"\b(?:cut|shut)\b.{0,35}\bfriend\w*\b|\bisolat\w*\b|\bno one\b", source_text, re.I):
@@ -1743,7 +2462,8 @@ def validate_stage2(
         for value in factors.get("functional_impact", [])
         if str(value).strip() and str(value).strip().lower() not in {"none", "unknown", "not specified"}
     ]
-    factor_text = text_values(factors).lower()
+    severity_factors = {key: value for key, value in factors.items() if key != "risk_denials"}
+    factor_text = text_values(severity_factors).lower()
     persistent = bool(
         re.search(r"\b(?:persistent|ongoing|constant|continuous|sustained|daily|frequent)\b", persistence)
     )
@@ -1764,10 +2484,10 @@ def validate_stage2(
     )
     if severity == "Minimal" and (intensity == "high" or persistent or impacts):
         return False, "Minimal conflicts with high/persistent symptoms or functional impact"
-    if severity == "Mild" and moderate_persistence:
-        return False, "Mild conflicts with persistent moderate/high symptoms"
+    if severity == "Mild" and (moderate_persistence or intensity == "high"):
+        return False, "Mild conflicts with high-intensity or persistent moderate symptoms"
     if severity == "Moderate" and not (
-        moderate_persistence or impacts or negative_bonding or urgent_or_hopeless
+        intensity == "high" or moderate_persistence or impacts or negative_bonding or urgent_or_hopeless
     ):
         return False, "Moderate lacks moderate/high persistence, impact, risk, or bonding difficulty"
     if severity == "Severe":
@@ -1786,7 +2506,8 @@ def disallowed_severity_labels(factors: dict[str, Any]) -> list[str]:
         for value in factors.get("functional_impact", [])
         if str(value).strip() and str(value).strip().lower() not in {"none", "unknown", "not specified"}
     ]
-    factor_text = text_values(factors).lower()
+    severity_factors = {key: value for key, value in factors.items() if key != "risk_denials"}
+    factor_text = text_values(severity_factors).lower()
     persistent = bool(
         re.search(r"\b(?:persistent|ongoing|constant|continuous|sustained|daily|frequent)\b", persistence)
     )
@@ -1808,9 +2529,9 @@ def disallowed_severity_labels(factors: dict[str, Any]) -> list[str]:
     disallowed = []
     if intensity == "high" or persistent or impacts:
         disallowed.append("Minimal")
-    if moderate_persistence:
+    if moderate_persistence or intensity == "high":
         disallowed.append("Mild")
-    if not (moderate_persistence or impacts or negative_bonding or urgent_or_hopeless):
+    if not (intensity == "high" or moderate_persistence or impacts or negative_bonding or urgent_or_hopeless):
         disallowed.append("Moderate")
     if not (intensity == "high" and bool(impacts or negative_bonding or urgent_or_hopeless)):
         disallowed.append("Severe")
@@ -1820,6 +2541,7 @@ def disallowed_severity_labels(factors: dict[str, Any]) -> list[str]:
 def validate_stage3(
     item: Any,
     *,
+    factors: dict[str, Any],
     expected_id: int,
     expected_severity: str,
     expected_timing: str,
@@ -1834,9 +2556,18 @@ def validate_stage3(
         return False, "not an object"
     if item.get("id") != expected_id:
         return False, f"id mismatch: {item.get('id')!r}"
+    normalize_stage3_language(item)
+    if item.get("grounding_method") != "deterministic_factor_fallback":
+        slot_values = stage3_sentence_values(item)
+        if not 2 <= len(slot_values) <= 4:
+            return False, "expected 2-4 complete sentence slots"
+        remove_unsourced_severity_descriptors(item, factors)
     text = materialize_stage3_text(item)
     if not text.strip():
         return False, "missing synthetic_text"
+    if item.get("target") is None or item.get("target") == "":
+        item["target"] = expected_severity
+        item["target_metadata_injected"] = True
     if item.get("target") != expected_severity:
         return False, f"target mismatch: {item.get('target')!r}"
     if use_timing:
@@ -1871,6 +2602,9 @@ def validate_stage3(
     overlap = shared_ngram_count(source_text, text, copy_ngram_size)
     if overlap > max_copy_ngrams:
         return False, f"source-copy overlap: {overlap} shared {copy_ngram_size}-grams"
+    quality_violations = narrative_quality_violations(item, text, factors)
+    if quality_violations:
+        return False, "narrative quality: " + ",".join(quality_violations)
     return True, ""
 
 
@@ -1894,7 +2628,21 @@ def validate_stage4(item: Any, *, use_timing: bool) -> tuple[bool, str]:
     return True, ""
 
 
-def validate_grounding_audit(item: Any, *, expected_id: int) -> tuple[bool, str]:
+def audit_claim_is_narrative_span(claim: str, narrative: str) -> bool:
+    """Reject auditor claims copied from its prompt or invented during review."""
+    def comparable(value: str) -> str:
+        value = value.lower().replace("\u2019", "'").replace("\u2018", "'")
+        value = re.sub(r"\s+", " ", value).strip()
+        return value.strip(" \t\r\n\"'.,;:!?()[]{}")
+
+    claim_value = comparable(claim)
+    narrative_value = comparable(narrative)
+    return word_count(claim_value) >= 3 and claim_value in narrative_value
+
+
+def validate_grounding_audit(
+    item: Any, *, expected_id: int, narrative: str
+) -> tuple[bool, str]:
     if not isinstance(item, dict):
         return False, "not an object"
     if item.get("id") != expected_id:
@@ -1932,15 +2680,21 @@ def validate_grounding_audit(item: Any, *, expected_id: int) -> tuple[bool, str]
         if claim:
             normalized_claims.append(claim)
     item["unsupported_claims"] = normalized_claims
+    unanchored = [
+        claim for claim in normalized_claims
+        if not audit_claim_is_narrative_span(claim, narrative)
+    ]
+    if unanchored:
+        return False, "unsupported_claims must be exact spans from the narrative"
     if grounded and normalized_claims:
         grounded = False
         item["grounded"] = False
+    if not grounded and not normalized_claims:
+        return False, "ungrounded assessment requires an exact narrative span"
     reason = item.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         reason = "; ".join(normalized_claims) or "No unsupported claim was identified."
         item["reason"] = reason
-    if not grounded and not normalized_claims:
-        item["unsupported_claims"] = [reason.strip()]
     return True, ""
 
 
@@ -2041,7 +2795,7 @@ def run_group_stage(
         attempt_group(pending, attempt_number)
 
     pending = [item_id for item_id in ids if results[item_id].status != "ok"]
-    if cfg.get("use_single_retry_pass", True):
+    if cfg.get("use_single_retry_pass", True) and len(ids) > 1:
         for item_id in pending:
             for retry in range(1, cfg["schema_retries"] + 1):
                 attempt_group([item_id], cfg["schema_retries"] + retry)
@@ -2094,6 +2848,7 @@ def factor_payload(item_id: int, factors: dict[str, Any], use_timing: bool) -> d
         "perceived_support",
         "bonding_indicators",
         "risk_indicators",
+        "risk_denials",
         "coping_or_adjustment_context",
     )
     payload = {"id": item_id, **{key: factors.get(key) for key in keys}}
@@ -2203,6 +2958,7 @@ def validate_direct_baseline(
     item_min, item_max = narrative_word_bounds(factors, cfg)
     ok, error = validate_stage3(
         narrative,
+        factors=factors,
         expected_id=expected_id,
         expected_severity=str(classification["severity"]),
         expected_timing=expected_timing,
@@ -2372,7 +3128,9 @@ def audit_direct_grounding(
         ids=active,
         make_prompt=make_prompt,
         validator=lambda item, item_id: validate_grounding_audit(
-            item, expected_id=item_id
+            item,
+            expected_id=item_id,
+            narrative=str((s3[item_id].value or {}).get("synthetic_text", "")),
         ),
         cfg={**cfg, "schema_retries": max(2, cfg["schema_retries"])},
         temperature=0.0,
@@ -2423,6 +3181,63 @@ def generation_payload(
     payload = factor_payload(item_id, factors, use_timing)
     payload["severity"] = severity["severity"]
     payload["disallowed_content_categories"] = disallowed_content_categories(factors)
+    persistence = str(factors.get("symptom_persistence") or "").strip().lower()
+    if persistence == "ongoing":
+        status_rule = (
+            "Use present/ongoing tense and explicitly write either 'I continue to' or "
+            "'I am still'; do not imply that symptoms resolved."
+        )
+    elif persistence.startswith("past,"):
+        status_rule = "Use past tense only; do not imply that symptoms or safety concerns are current or resolved."
+    elif persistence in {"resolved", "improved", "recovered", "no longer present"}:
+        status_rule = "Use past tense and preserve that symptoms improved or resolved; do not imply current symptoms."
+    else:
+        status_rule = "Do not assert that symptoms are ongoing, historical, or resolved; use temporally neutral wording."
+    if factors.get("risk_denials"):
+        status_rule += " Preserve every risk denial explicitly and only as a denial."
+    payload["required_status_rule"] = status_rule
+    return payload
+
+
+def scaffolded_generation_payload(
+    item_id: int,
+    factors: dict[str, Any],
+    severity: dict[str, Any],
+    use_timing: bool,
+    min_words: int,
+    max_words: int,
+) -> dict[str, Any]:
+    """Give Stage 3 a grounded content plan before it performs surface rewriting."""
+    payload = generation_payload(item_id, factors, severity, use_timing)
+    target = str(severity.get("severity", ""))
+    payload.pop("severity", None)
+    payload["target_expression_rule"] = {
+        "Minimal": "Use low, brief distress wording and do not imply impairment.",
+        "Mild": "Use noticeable distress wording without adding persistence or impairment.",
+        "Moderate": (
+            "Use meaningful emotional difficulty; preserve persistence or impairment only "
+            "when the grounded scaffold contains it."
+        ),
+        "Severe": (
+            "Preserve the scaffold's intense distress and any explicit major impact, "
+            "bonding disruption, or risk statement."
+        ),
+    }.get(target, "Follow the grounded scaffold without changing its clinical strength.")
+    payload["deidentified_summary"] = stage3_generalized_summary(
+        str(payload.get("deidentified_summary") or "")
+    )
+    scaffold = conservative_factor_narrative(
+        factors,
+        str(severity.get("severity", "")),
+        use_timing,
+        min_words,
+        max_words,
+        item_id,
+    )
+    scaffold_text = str(scaffold.get("synthetic_text", "")).strip()
+    scaffold_slots = stage3_sentence_values({"synthetic_text": scaffold_text})
+    payload["grounded_scaffold"] = scaffold_text
+    payload["required_sentence_count"] = min(4, max(2, len(scaffold_slots)))
     return payload
 
 
@@ -2446,15 +3261,17 @@ def generate_stage3(
     def make_prompt(group_ids: Sequence[int], schema_attempt: int) -> str:
         payloads = []
         for item_id in group_ids:
-            payload = generation_payload(
+            item_min, item_max = prompt_bounds(item_id)
+            payload = scaffolded_generation_payload(
                 item_id,
                 stage1_results[item_id].value or {},
                 stage2_results[item_id].value or {},
                 cfg["use_timing"],
+                item_min,
+                item_max,
             )
             if validator_feedback and item_id in validator_feedback:
                 payload["validator_feedback"] = validator_feedback[item_id]
-            item_min, item_max = prompt_bounds(item_id)
             payload["required_min_words"] = item_min
             payload["required_max_words"] = item_max
             payloads.append(payload)
@@ -2473,6 +3290,7 @@ def generate_stage3(
         item_min, item_max = bounds(item_id)
         return validate_stage3(
             item,
+            factors=factors,
             expected_id=item_id,
             expected_severity=str(severity.get("severity", "")),
             expected_timing=str(factors.get("postpartum_timing", "unknown")),
@@ -2514,7 +3332,9 @@ def generate_stage3(
         item_min, item_max = prompt_bounds(item_id)
         payload = {
             "id": item_id,
-            "factors": generation_payload(item_id, factors, severity, cfg["use_timing"]),
+            "factors": scaffolded_generation_payload(
+                item_id, factors, severity, cfg["use_timing"], item_min, item_max
+            ),
             "target": severity.get("severity"),
             "expected_timing": factors.get("postpartum_timing", "unknown"),
             "under_length_draft": (generated[item_id].last_candidate or {}).get(
@@ -2566,7 +3386,9 @@ def generate_stage3(
         item_min, item_max = prompt_bounds(item_id)
         payload = {
             "id": item_id,
-            "factors": generation_payload(item_id, factors, severity, cfg["use_timing"]),
+            "factors": scaffolded_generation_payload(
+                item_id, factors, severity, cfg["use_timing"], item_min, item_max
+            ),
             "target": severity.get("severity"),
             "expected_timing": factors.get("postpartum_timing", "unknown"),
             "draft_to_rewrite": (generated[item_id].value or {}).get("synthetic_text", ""),
@@ -2604,6 +3426,48 @@ def generate_stage3(
         )[item_id]
         repaired.attempts += generated[item_id].attempts
         repaired.errors = generated[item_id].errors + repaired.errors
+        generated[item_id] = repaired
+
+    # 2026-09-04: repair validator failures before using deterministic prose.
+    validation_repair_ids = [
+        item_id
+        for item_id, result in generated.items()
+        if result.status != "ok" or result.value is None
+    ]
+    validation_cfg = {**cfg, "schema_retries": max(2, cfg["schema_retries"])}
+    for item_id in validation_repair_ids:
+        prior = generated[item_id]
+        factors = stage1_results[item_id].value or {}
+        severity = stage2_results[item_id].value or {}
+        item_min, item_max = prompt_bounds(item_id)
+        payload = {
+            "id": item_id,
+            "factors": scaffolded_generation_payload(
+                item_id, factors, severity, cfg["use_timing"], item_min, item_max
+            ),
+            "target": severity.get("severity"),
+            "expected_timing": factors.get("postpartum_timing", "unknown"),
+            "rejected_draft": (prior.last_candidate or {}).get("synthetic_text", ""),
+            "validation_errors": prior.errors[-4:],
+        }
+
+        def validation_prompt(_: Sequence[int], __: int) -> str:
+            return prompt_stage3_validation_repair(
+                payload, item_min, item_max, cfg["use_timing"]
+            )
+
+        repaired = run_group_stage(
+            ids=[item_id],
+            make_prompt=validation_prompt,
+            validator=content_validator,
+            cfg=validation_cfg,
+            temperature=min(cfg["temp_s3"], 0.6),
+            tokens_per_item=cfg["tokens_s3_per_item"],
+            stage_number=45 + regeneration_attempt * 10,
+            usage=usage,
+        )[item_id]
+        repaired.attempts += prior.attempts
+        repaired.errors = prior.errors + repaired.errors
         generated[item_id] = repaired
 
     for item_id, result in generated.items():
@@ -2685,7 +3549,9 @@ def generate_stage3(
             ids=active_ids,
             make_prompt=grounding_prompt,
             validator=lambda item, item_id: validate_grounding_audit(
-                item, expected_id=item_id
+                item,
+                expected_id=item_id,
+                narrative=str((generated[item_id].value or {}).get("synthetic_text", "")),
             ),
             cfg=audit_cfg,
             temperature=0.0,
@@ -2766,6 +3632,11 @@ def generate_stage3(
                 result.value["grounding_attempts"] = grounding_attempts[item_id]
                 continue
 
+            result.errors.append(
+                "semantic grounding rejected: "
+                + "; ".join(assessment["unsupported_claims"])
+            )
+
             if audit_round == 1:
                 factors = stage1_results[item_id].value or {}
                 severity = stage2_results[item_id].value or {}
@@ -2824,8 +3695,8 @@ def generate_stage3(
             def semantic_prompt(_: Sequence[int], __: int) -> str:
                 payload = {
                     "id": item_id,
-                    "factors": generation_payload(
-                        item_id, factors, severity, cfg["use_timing"]
+                    "factors": scaffolded_generation_payload(
+                        item_id, factors, severity, cfg["use_timing"], prompt_min, prompt_max
                     ),
                     "target": severity.get("severity"),
                     "expected_timing": factors.get("postpartum_timing", "unknown"),
@@ -2923,13 +3794,18 @@ def stage4_single(
             continue
         ok, error = validate_stage4(parsed, use_timing=cfg["use_timing"])
         if ok:
-            parsed["raw_predicted_severity"] = parsed["predicted_severity"]
-            parsed["predicted_severity"] = calibrate_blind_severity(
-                narrative, str(parsed["predicted_severity"])
+            raw_severity = str(parsed["predicted_severity"])
+            parsed["raw_predicted_severity"] = raw_severity
+            parsed["calibrated_predicted_severity"] = calibrate_blind_severity(
+                narrative, raw_severity
             )
+            # The independent raw verdict drives acceptance. Calibration is diagnostic.
+            parsed["predicted_severity"] = raw_severity
             if cfg["use_timing"]:
-                parsed["raw_predicted_timing"] = parsed["predicted_timing"]
-                parsed["predicted_timing"] = blind_timing_bucket(narrative)
+                raw_timing = str(parsed["predicted_timing"])
+                parsed["raw_predicted_timing"] = raw_timing
+                parsed["deterministic_predicted_timing"] = blind_timing_bucket(narrative)
+                parsed["predicted_timing"] = raw_timing
             result.value = parsed
             result.status = "ok"
             return result
@@ -2994,7 +3870,13 @@ def stages3_and4(
                 "round": validation_round,
                 "status": validation.status,
                 "prediction": (validation.value or {}).get("predicted_severity", ""),
+                "calibrated_prediction": (validation.value or {}).get(
+                    "calibrated_predicted_severity", ""
+                ),
                 "predicted_timing": (validation.value or {}).get("predicted_timing", ""),
+                "deterministic_timing": (validation.value or {}).get(
+                    "deterministic_predicted_timing", ""
+                ),
                 "confidence": (validation.value or {}).get("confidence", ""),
                 "errors": validation.errors,
             }
@@ -3093,7 +3975,13 @@ def direct_stages_and4(
                     "round": validation_round,
                     "status": validation.status,
                     "prediction": (validation.value or {}).get("predicted_severity", ""),
+                    "calibrated_prediction": (validation.value or {}).get(
+                        "calibrated_predicted_severity", ""
+                    ),
                     "predicted_timing": (validation.value or {}).get("predicted_timing", ""),
+                    "deterministic_timing": (validation.value or {}).get(
+                        "deterministic_predicted_timing", ""
+                    ),
                     "confidence": (validation.value or {}).get("confidence", ""),
                     "errors": validation.errors,
                 }
@@ -3253,8 +4141,10 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
         text = str(generated.get("synthetic_text", ""))
         intended = str(severity.get("severity", ""))
         predicted = str(validation.get("predicted_severity", ""))
+        calibrated_predicted = str(validation.get("calibrated_predicted_severity", ""))
         timing = str(factors.get("postpartum_timing", ""))
         predicted_timing = str(validation.get("predicted_timing", ""))
+        deterministic_timing = str(validation.get("deterministic_predicted_timing", ""))
         required_min_words, required_max_words = narrative_word_bounds(factors, cfg)
         row = record["input"]
         rows.append(
@@ -3282,6 +4172,7 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
                 "s1_perceived_support": factors.get("perceived_support", ""),
                 "s1_bonding_indicators": factors.get("bonding_indicators", []),
                 "s1_risk_indicators": factors.get("risk_indicators", []),
+                "s1_risk_denials": factors.get("risk_denials", []),
                 "s1_coping_or_adjustment_context": factors.get(
                     "coping_or_adjustment_context", ""
                 ),
@@ -3308,26 +4199,39 @@ def process_batch(task: tuple[int, list[dict[str, Any]], dict[str, Any]]) -> dic
                 "s3_identifier_leaks": identifier_leaks(text),
                 "s3_shared_source_ngrams": shared_ngram_count(source, text, cfg["copy_ngram_size"]),
                 "s3_unsupported_detail_flags": unsupported_detail_categories(text, factors),
+                "s3_quality_flags": narrative_quality_violations(generated, text, factors),
                 "s3_grounding_passed": bool(generated.get("grounding_passed", False)),
                 "s3_grounding_attempts": generated.get("grounding_attempts", 0),
                 "s3_grounding_history": generated.get("grounding_history", []),
                 # a 100% acceptance rate hid a 100% fallback rate in pilot20_v410
                 "s3_provenance": stage3_provenance(generated),
                 "s3_timing_cue_injected": bool(generated.get("timing_cue_injected", False)),
+                "s3_severity_descriptor_removed": bool(
+                    generated.get("severity_descriptor_removed", False)
+                ),
+                "s3_language_normalized": bool(generated.get("language_normalized", False)),
                 "s3_regen_count": outcomes[item_id]["regen_count"],
                 "s4_status": s4[item_id].status,
                 "s4_attempts": s4[item_id].attempts,
                 "s4_error": last_error(s4[item_id]),
                 "s4_predicted_severity": predicted,
                 "s4_raw_predicted_severity": validation.get("raw_predicted_severity", ""),
+                "s4_calibrated_predicted_severity": calibrated_predicted,
                 "s4_predicted_timing": predicted_timing,
                 "s4_raw_predicted_timing": validation.get("raw_predicted_timing", ""),
+                "s4_deterministic_predicted_timing": deterministic_timing,
                 "s4_confidence": validation.get("confidence", ""),
                 "s4_evidence": validation.get("evidence", ""),
                 "s4_history": outcomes[item_id]["validator_history"],
                 "severity_agreement": bool(predicted and predicted == intended),
+                "calibrated_severity_agreement": bool(
+                    calibrated_predicted and calibrated_predicted == intended
+                ),
                 "timing_agreement": bool(
                     cfg["use_timing"] and predicted_timing and predicted_timing == timing
+                ),
+                "deterministic_timing_agreement": bool(
+                    cfg["use_timing"] and deterministic_timing and deterministic_timing == timing
                 ),
                 "row_status": outcomes[item_id]["row_status"],
                 "batch_elapsed_seconds": round(elapsed, 3),
@@ -3452,9 +4356,24 @@ def validate_or_create_manifest(path: Path, requested: dict[str, Any]) -> dict[s
 
 def update_manifest_runtime(path: Path, manifest: dict[str, Any], digest: str | None) -> None:
     updated = dict(manifest)
-    updated["model_digest"] = digest
+    if digest:
+        updated["model_digest"] = digest
     updated["last_completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     atomic_write_json(path, updated)
+
+
+def lock_manifest_model(
+    path: Path, manifest: dict[str, Any], digest: str
+) -> dict[str, Any]:
+    """Pin the model before the first checkpoint is generated."""
+    existing = str(manifest.get("model_digest") or "")
+    if existing and existing != digest:
+        raise RuntimeError(
+            "Ollama model digest changed for this output directory; use a new --outdir"
+        )
+    updated = {**manifest, "model_digest": digest}
+    atomic_write_json(path, updated)
+    return updated
 
 
 def stringify(value: Any) -> Any:
@@ -3505,6 +4424,7 @@ def merge_batches(
         "postpartum_timing",
         "word_count",
         "validator_predicted_severity",
+        "validator_calibrated_severity",
         "validator_confidence",
         "regeneration_count",
     )
@@ -3522,6 +4442,9 @@ def merge_batches(
                     "postpartum_timing": row["s1_postpartum_timing"],
                     "word_count": row["s3_word_count"],
                     "validator_predicted_severity": row["s4_predicted_severity"],
+                    "validator_calibrated_severity": row[
+                        "s4_calibrated_predicted_severity"
+                    ],
                     "validator_confidence": row["s4_confidence"],
                     "regeneration_count": row["s3_regen_count"],
                 }
@@ -3563,9 +4486,27 @@ def merge_batches(
         "severity_agreement_rate_pct": rate(
             sum(bool(row["severity_agreement"]) for row in validated), len(validated)
         ),
+        "raw_blind_severity_agreement_rate_pct": rate(
+            sum(bool(row["severity_agreement"]) for row in validated), len(validated)
+        ),
+        "calibrated_severity_agreement_rate_pct": rate(
+            sum(bool(row["calibrated_severity_agreement"]) for row in validated),
+            len(validated),
+        ),
         "timing_agreement_rate_pct": rate(
             sum(bool(row["timing_agreement"]) for row in timing_validated),
             len(timing_validated),
+        ) if cfg["use_timing"] else None,
+        "raw_blind_timing_agreement_all_rows_pct": rate(
+            sum(bool(row["timing_agreement"]) for row in validated), len(validated)
+        ) if cfg["use_timing"] else None,
+        "deterministic_timing_agreement_rate_pct": rate(
+            sum(bool(row["deterministic_timing_agreement"]) for row in timing_validated),
+            len(timing_validated),
+        ) if cfg["use_timing"] else None,
+        "deterministic_timing_agreement_all_rows_pct": rate(
+            sum(bool(row["deterministic_timing_agreement"]) for row in validated),
+            len(validated),
         ) if cfg["use_timing"] else None,
         "timing_agreement_evaluable_rows": len(timing_validated) if cfg["use_timing"] else None,
         "rows_regenerated": sum(int(row["s3_regen_count"]) > 0 for row in eligible_rows),
@@ -3576,6 +4517,9 @@ def merge_batches(
         "identifier_violations_in_saved_rows": sum(bool(row["s3_identifier_leaks"]) for row in eligible_rows),
         "rows_flagged_for_unsupported_detail_review": sum(
             bool(row.get("s3_unsupported_detail_flags")) for row in eligible_rows
+        ),
+        "rows_flagged_for_quality_review": sum(
+            bool(row.get("s3_quality_flags")) for row in eligible_rows
         ),
         # report generated vs fallback separately; acceptance alone hides this
         "accepted_from_llm_generation": sum(
@@ -3716,7 +4660,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-regen", type=int, default=2)
     parser.add_argument("--temp-s1", type=float, default=0.3)
     parser.add_argument("--temp-s2", type=float, default=0.2)
-    parser.add_argument("--temp-s3", type=float, default=1.1)
+    parser.add_argument("--temp-s3", type=float, default=0.65)
     parser.add_argument("--temp-s4", type=float, default=0.2)
     parser.add_argument("--tokens-s1-per-item", type=int, default=320)
     parser.add_argument("--tokens-s2-per-item", type=int, default=120)
@@ -3733,7 +4677,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ablation: use the global word range even for sparse factors",
     )
-    parser.add_argument("--sparse-min-words", type=int, default=20)
+    parser.add_argument("--sparse-min-words", type=int, default=18)
     parser.add_argument("--sparse-target-max-words", type=int, default=45)
     parser.add_argument("--sparse-max-words", type=int, default=65)
     parser.add_argument("--copy-ngram-size", type=int, default=8)
@@ -3892,6 +4836,16 @@ def main() -> int:
             )
             return 3
         log("Ollama preflight succeeded.", log_file)
+        if not digest:
+            digest = model_digest(args.ollama_host, args.ollama_model)
+        if not digest:
+            log("ERROR: Ollama model digest could not be recorded.", log_file)
+            return 3
+        try:
+            manifest = lock_manifest_model(manifest_path, manifest, digest)
+        except RuntimeError as exc:
+            log(f"ERROR: {exc}", log_file)
+            return 3
 
         try:
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -3915,6 +4869,12 @@ def main() -> int:
             log("Interrupted. Durable completed batches are safe; rerun the same command to resume.", log_file)
             return 130
     else:
+        if digest:
+            try:
+                manifest = lock_manifest_model(manifest_path, manifest, digest)
+            except RuntimeError as exc:
+                log(f"ERROR: {exc}", log_file)
+                return 3
         log("All batches already have valid checkpoints; rebuilding final outputs.", log_file)
 
     refresh_checkpoint(outdir, batches)
@@ -3923,7 +4883,9 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         log(f"ERROR during merge: {exc}", log_file)
         return 5
-    update_manifest_runtime(manifest_path, manifest, digest)
+    update_manifest_runtime(
+        manifest_path, manifest, digest or str(manifest.get("model_digest") or "") or None
+    )
 
     eligible_total = int(summary["eligible_rows"])
     rejection_rate = 1.0 - (summary["accepted_rows"] / eligible_total) if eligible_total else 0.0
@@ -3939,6 +4901,12 @@ def main() -> int:
         f"Accepted text source: {summary['accepted_from_llm_generation']} generated, "
         f"{summary['accepted_from_deterministic_fallback']} deterministic fallback "
         f"({summary['fallback_rate_among_accepted_pct']}% fallback).",
+        log_file,
+    )
+    log(
+        "Blind severity agreement: "
+        f"{summary['raw_blind_severity_agreement_rate_pct']}% raw; "
+        f"{summary['calibrated_severity_agreement_rate_pct']}% calibrated diagnostic.",
         log_file,
     )
     if summary["fallback_rate_among_accepted_pct"] >= 50.0:
