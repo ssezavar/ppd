@@ -42,7 +42,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-SCRIPT_VERSION = "ppd_generate_final v4.56"
+SCRIPT_VERSION = "ppd_generate_final v4.58"
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 FAILED_SENTINEL = "[GENERATION_FAILED]"
 
@@ -160,6 +160,12 @@ _CANONICAL_TIMING_PREFIXES = {
     TIMING_BUCKETS[2]: "Between six and twelve weeks after birth,",
     TIMING_BUCKETS[3]: "More than three months after birth,",
 }
+_POSTPARTUM_TIMING_CUE = re.compile(
+    r"\b(?:after giving birth|(?:during|in) (?:my|the) postpartum period|"
+    r"within the first two weeks after birth|between two and six weeks after birth|"
+    r"between six and twelve weeks after birth|more than three months after birth)\b",
+    re.I,
+)
 
 
 def add_timing_opener(text: str, timing: str) -> str:
@@ -724,9 +730,16 @@ def stage3_sentence_values(item: dict[str, Any]) -> list[str]:
     return cleaned_sentences
 
 
-def normalize_stage3_language(item: dict[str, Any]) -> None:
+def normalize_stage3_language(
+    item: dict[str, Any], factors: dict[str, Any] | None = None
+) -> None:
     """Clean a few harmless local-model phrasing errors before validation."""
     sentences = stage3_sentence_values(item)
+    supported_context = {
+        str(value).strip().lower()
+        for value in (factors or {}).get("supported_context", [])
+        if str(value).strip()
+    }
     replacements = (
         (r"\bI felt supported by strong support from\b", "I felt strongly supported by"),
         (r"\bI feel supported by strong support from\b", "I feel strongly supported by"),
@@ -736,6 +749,7 @@ def normalize_stage3_language(item: dict[str, Any]) -> None:
         (r"^Within my postpartum experience,?\s*", "After giving birth, "),
         (r",?\s*but now I see its impact\b", ""),
         (r"\s+and find a way forward\b", ""),
+        (r",?\s+and (?:it|this) (?:has )?weigh(?:s|ed) heavily on me\b", ""),
         (
             r"^(?:Emotional and physical|Physical and emotional) changes "
             r"have been ongoing since giving birth",
@@ -748,6 +762,20 @@ def normalize_stage3_language(item: dict[str, Any]) -> None:
         value = sentence
         for pattern, replacement in replacements:
             value = re.sub(pattern, replacement, value, flags=re.I)
+        if "was on maternity leave" in supported_context:
+            value = re.sub(
+                r"^My coping mechanisms? (?:have|had) not improved since "
+                r"(?:taking|starting|being on) maternity leave[.!?]?$",
+                "I was on maternity leave during this period.",
+                value,
+                flags=re.I,
+            )
+        value = re.sub(
+            r",?\s+which affect(?:s|ed) me deeply\b",
+            "",
+            value,
+            flags=re.I,
+        )
         if value and not re.search(r"[.!?][\"']?$", value):
             value += "."
         changed = changed or value != sentence
@@ -758,15 +786,12 @@ def normalize_stage3_language(item: dict[str, Any]) -> None:
 
 
 def normalize_stage3_timing(item: dict[str, Any], expected_timing: str) -> None:
-    """Repair metadata and remove only explicit unsupported birth-timing cues."""
+    """Repair metadata and keep one source-controlled birth-timing cue."""
     normalized = normalize_timing(item.get("timing"))
     if normalized != expected_timing:
         item["raw_timing_metadata"] = item.get("timing", "")
         item["timing"] = expected_timing
         item["timing_metadata_normalized"] = True
-    if expected_timing != "unknown":
-        return
-
     sentences = stage3_sentence_values(item)
     changed = False
     cleaned: list[str] = []
@@ -779,18 +804,43 @@ def normalize_stage3_timing(item: dict[str, Any], expected_timing: str) -> None:
         r"(?:days?|weeks?|months?) (?:after|since) (?:birth|delivery|giving birth))\b",
         re.I,
     )
+    cue_seen = False
     for sentence in sentences:
-        value = birth_relative.sub("after giving birth", sentence)
-        value = re.sub(r"\bnewborn\b", "baby", value, flags=re.I)
-        value = re.sub(r"\bearly postpartum\b", "postpartum", value, flags=re.I)
-        value = re.sub(r"\b(?:in the )?early days\b", "during the postpartum period", value, flags=re.I)
-        value = re.sub(r"\b(?:from the start|early on)\b,?\s*", "", value, flags=re.I)
+        value = sentence
+        if expected_timing == "unknown":
+            value = birth_relative.sub("after giving birth", value)
+            value = re.sub(r"\bnewborn\b", "baby", value, flags=re.I)
+            value = re.sub(r"\bearly postpartum\b", "postpartum", value, flags=re.I)
+            value = re.sub(
+                r"\b(?:in the )?early days\b",
+                "during the postpartum period",
+                value,
+                flags=re.I,
+            )
+            value = re.sub(r"\b(?:from the start|early on)\b,?\s*", "", value, flags=re.I)
+
+            # 2026-09-07: Keep one broad cue; later copies add no information.
+            def keep_first_cue(match: re.Match[str]) -> str:
+                nonlocal cue_seen
+                if cue_seen:
+                    return ""
+                cue_seen = True
+                return match.group(0)
+
+            value = _POSTPARTUM_TIMING_CUE.sub(keep_first_cue, value)
+        else:
+            value = _POSTPARTUM_TIMING_CUE.sub("", value)
+        value = re.sub(r"^\s*[,;:]\s*", "", value)
+        value = re.sub(r"\s+([,.!?])", r"\1", value)
         value = re.sub(r"\s+", " ", value).strip()
         if value and not re.search(r"[.!?][\"']?$", value):
             value += "."
         changed = changed or value != sentence
         if value:
             cleaned.append(value)
+    if expected_timing in _CANONICAL_TIMING_PREFIXES and cleaned:
+        cleaned[0] = add_timing_opener(cleaned[0], expected_timing)
+    changed = cleaned != sentences
     if changed:
         item["sentences"] = cleaned
         item["timing_language_normalized"] = True
@@ -1649,9 +1699,10 @@ _STOCK_OR_CLINICAL_NARRATIVE_PATTERN = re.compile(
     r"within my postpartum experience|"
     r"as i reflect on my postpartum journey|within this timeframe|navigate these changes|"
     r"i describe\b.{0,45}\b(?:experience|emotion)|positive bonding experience|"
-    r"part of my emotional experience|coping mechanism|before intervention|the condition|"
+    r"part of my emotional experience|coping mechanisms?|before intervention|the condition|"
     r"due to its negative impact|emotional symptoms|low support|noticeable distress|"
     r"feel emotionally difficult|symptoms paused|past impact on me|"
+    r"weigh(?:s|ed|ing)? heavily on me|affect(?:s|ed|ing)? me deeply|"
     r"at this point,? i (?:did not|didn't) (?:recognize|realize)\b.{0,30}\bat first)\b",
     re.I,
 )
@@ -3208,7 +3259,7 @@ def validate_stage3(
         return False, "not an object"
     if item.get("id") != expected_id:
         return False, f"id mismatch: {item.get('id')!r}"
-    normalize_stage3_language(item)
+    normalize_stage3_language(item, factors)
     if item.get("grounding_method") != "deterministic_factor_fallback":
         slot_values = stage3_sentence_values(item)
         if not 2 <= len(slot_values) <= 4:
