@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical four-stage PPD synthetic-narrative generator.
 
-Author: Sara Sezavar
+Author: Sara Sezavar (sara.sezavar1@gmail.com)
 
 Pipeline
 --------
